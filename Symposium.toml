@@ -1,0 +1,10 @@
+name = "jero-arch-vision"
+# Crate-embedded Symposium manifest for jero-arch-vision.
+
+[[plugins]]
+depends-on = ["jero-core"]
+source.cargo = "jero-core"
+
+[[plugins]]
+depends-on = ["jero-kernels-rvv"]
+source.cargo = "jero-kernels-rvv"
