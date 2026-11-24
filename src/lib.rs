@@ -504,16 +504,16 @@ mod tests {
         )
     }
 
-    struct MissingFc2<'a>(&'a SafeTensorsFile<'a>);
-    impl ModelWeights for MissingFc2<'_> {
+    struct FilteredWeights<'a>(&'a SafeTensorsFile<'a>, &'static str);
+    impl ModelWeights for FilteredWeights<'_> {
         fn tensor(&self, name: &str) -> Result<jero_core::TensorView<'_>, K3Error> {
-            if name == "mm.2.weight" {
+            if name == self.1 {
                 return Err(K3Error::TensorBoundsError {
                     tensor_name: name.to_owned(),
                     offset: 0,
                     byte_len: 0,
                     buffer_len: 0,
-                    reason: "injected missing mm.2.weight".to_owned(),
+                    reason: format!("injected missing tensor '{name}'"),
                 });
             }
             self.0.tensor(name)
@@ -819,7 +819,112 @@ mod tests {
 
         // 7. fc1 without fc2 must fail closed (never fall back silently)
         assert!(matches!(
-            bridge_no_mm.encode_image_to_soft_prompt(&MissingFc2(&clip_st), &valid_pixels, 3, 4, 4),
+            bridge_no_mm.encode_image_to_soft_prompt(
+                &FilteredWeights(&clip_st, "mm.2.weight"),
+                &valid_pixels,
+                3,
+                4,
+                4
+            ),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_model_enforces_adr045_checks_for_clip_and_siglip() {
+        let clip_bytes = build_clip_safetensors_bytes(8, 16, 2, 4, 6, false, 12);
+        let clip_st = SafeTensorsFile::from_bytes(&clip_bytes).expect("parse clip st");
+        let clip = ClipVisionRecipe::from_safetensors(&clip_st)
+            .with_dims(4, 2, 1, 8, 16, 2)
+            .with_projection_dim(6);
+        clip.validate_model(clip_st.metadata(), &clip_st)
+            .expect("valid CLIP passes validate_model");
+
+        let sig_bytes = build_siglip_safetensors_bytes(8, 16, 2, 4, true, false, 10);
+        let sig_st = SafeTensorsFile::from_bytes(&sig_bytes).expect("parse siglip st");
+        let sig = SiglipVisionRecipe::from_safetensors(&sig_st).with_dims(4, 2, 1, 8, 16, 2);
+        sig.validate_model(sig_st.metadata(), &sig_st)
+            .expect("valid SigLIP passes validate_model");
+
+        // Unrelated LLM / tabular metadata fails closed on both recipes.
+        let llama_gguf_bytes = create_synthetic_gguf_v3_with_kvs("llama", 1, &[], &[]);
+        let llama_gguf = GgufFile::parse(&llama_gguf_bytes).expect("parse llama gguf");
+        assert!(matches!(
+            clip.validate_model(llama_gguf.metadata(), &clip_st),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+        assert!(matches!(
+            sig.validate_model(llama_gguf.metadata(), &sig_st),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        // SigLIP accepts GGUF `general.architecture = "clip"` metadata (mmproj-*.gguf compatibility),
+        // while CLIP rejects `siglip` metadata.
+        sig.validate_model(clip_st.metadata(), &sig_st)
+            .expect("SigLIP accepts clip metadata for mmproj compatibility");
+        assert!(matches!(
+            clip.validate_model(sig_st.metadata(), &clip_st),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        // Invalid recipe hyperparameters fail closed.
+        let mut bad_clip = clip.clone();
+        bad_clip.hidden_dim = 0;
+        assert!(matches!(
+            bad_clip.validate_model(clip_st.metadata(), &clip_st),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+        assert!(matches!(
+            clip.clone()
+                .with_projection_dim(0)
+                .validate_model(clip_st.metadata(), &clip_st),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        // Wrong visual_projection dim fails closed.
+        assert!(matches!(
+            clip.clone()
+                .with_projection_dim(12)
+                .validate_model(clip_st.metadata(), &clip_st),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        // Corrupted rms_norm_eps (negative / NaN) does not poison hydrated norm_eps.
+        let bad_eps_gguf_bytes = create_synthetic_gguf_v3_with_kvs(
+            "clip",
+            1,
+            &[(
+                "clip.attention.layer_norm_rms_epsilon",
+                GgufValue::Float32(-1.0),
+            )],
+            &[],
+        );
+        let bad_eps_gguf = GgufFile::parse(&bad_eps_gguf_bytes).expect("parse bad eps gguf");
+        let hydrated = ClipVisionRecipe::from_metadata(bad_eps_gguf.metadata());
+        assert!(hydrated.norm_eps.is_finite() && hydrated.norm_eps > 0.0);
+
+        // Missing required tensors when `weights.tensor_count() > 0` fail closed.
+        for missing_name in [
+            "v.patch_embd.weight",
+            "v.class_embd",
+            "v.position_embd.weight",
+            "v.blk.0.attn_q.weight",
+            "v.post_ln.weight",
+        ] {
+            let filtered = FilteredWeights(&clip_st, missing_name);
+            assert!(
+                matches!(
+                    clip.validate_model(clip_st.metadata(), &filtered),
+                    Err(K3Error::TensorBoundsError { .. })
+                ),
+                "expected validate_model to fail when '{missing_name}' is missing"
+            );
+        }
+        assert!(matches!(
+            sig.validate_model(
+                sig_st.metadata(),
+                &FilteredWeights(&sig_st, "vision_model.post_layernorm.weight")
+            ),
             Err(K3Error::TensorBoundsError { .. })
         ));
     }

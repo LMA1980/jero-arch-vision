@@ -447,11 +447,37 @@ pub(crate) fn decode_optional_1d(
     decode_1d_view(&view, expected_len, arch).map(Some)
 }
 
-pub(crate) fn decode_1d_view(
+pub(crate) fn validate_view_ready(view: &TensorView<'_>, arch: &str) -> Result<(), K3Error> {
+    if !is_supported_vision_quant(view.quant()) {
+        return Err(K3Error::unsupported_tensor_quant(
+            arch,
+            view.name(),
+            view.quant(),
+        ));
+    }
+    let req = view
+        .quant()
+        .storage_bytes(view.name(), view.num_elements())?;
+    let actual = view.as_bytes().len();
+    if actual < req {
+        return Err(bounds_err(
+            view.name(),
+            req,
+            actual,
+            format!(
+                "tensor '{}' payload truncated: {actual} bytes < required {req}",
+                view.name()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_1d_view(
     view: &TensorView<'_>,
     expected_len: usize,
     arch: &str,
-) -> Result<Vec<f32>, K3Error> {
+) -> Result<(), K3Error> {
     if expected_len == 0 {
         return Err(bounds_err(
             view.name(),
@@ -487,6 +513,15 @@ pub(crate) fn decode_1d_view(
             ),
         ));
     }
+    validate_view_ready(view, arch)
+}
+
+pub(crate) fn decode_1d_view(
+    view: &TensorView<'_>,
+    expected_len: usize,
+    arch: &str,
+) -> Result<Vec<f32>, K3Error> {
+    validate_1d_view(view, expected_len, arch)?;
     decode_all_finite(view, arch)
 }
 

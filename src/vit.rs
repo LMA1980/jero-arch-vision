@@ -22,8 +22,9 @@ use crate::kernels::{
     decode_all_finite, decode_optional_1d, decode_required_1d, gelu_inplace_f32,
     infer_2d_other_dim, interpolate_2d_pos_embed_f32, is_supported_vision_quant, layernorm_f32,
     linear_forward_seq, lookup_first_tensor, lookup_optional_tensor, matvec_slice, mismatch_err,
-    pool_and_l2_normalize_f32, quick_gelu_inplace, resize_rgb_bilinear_norm_f32,
-    validate_finite_slice, validate_float_view_finite,
+    pool_and_l2_normalize_f32, quick_gelu_inplace, resize_rgb_bilinear_norm_f32, validate_1d_view,
+    validate_2d_linear_shape, validate_finite_slice, validate_float_view_finite,
+    validate_view_ready,
 };
 
 const CLIP_IMAGE_MEAN: [f32; 3] = [0.481_454_66_f32, 0.457_827_5_f32, 0.408_210_73_f32];
@@ -102,6 +103,49 @@ const VISUAL_PROJ_BIAS_ALIASES: &[&str] = &[
     "vision_model.visual_projection.bias",
 ];
 const MAP_PROBE_ALIASES: &[&str] = &["v.head.probe", "head.probe", "vision_model.head.probe"];
+const LAYER_LN1_WEIGHT_SUFFIXES: &[&str] = &[
+    "ln1.weight",
+    "attn_norm.weight",
+    "layer_norm1.weight",
+    "norm1.weight",
+];
+const LAYER_LN1_BIAS_SUFFIXES: &[&str] = &[
+    "ln1.bias",
+    "attn_norm.bias",
+    "layer_norm1.bias",
+    "norm1.bias",
+];
+const LAYER_LN2_WEIGHT_SUFFIXES: &[&str] = &[
+    "ln2.weight",
+    "ffn_norm.weight",
+    "layer_norm2.weight",
+    "norm2.weight",
+];
+const LAYER_LN2_BIAS_SUFFIXES: &[&str] = &[
+    "ln2.bias",
+    "ffn_norm.bias",
+    "layer_norm2.bias",
+    "norm2.bias",
+];
+const LAYER_Q_WEIGHT_SUFFIXES: &[&str] = &["attn_q.weight", "self_attn.q_proj.weight"];
+const LAYER_K_WEIGHT_SUFFIXES: &[&str] = &["attn_k.weight", "self_attn.k_proj.weight"];
+const LAYER_V_WEIGHT_SUFFIXES: &[&str] = &["attn_v.weight", "self_attn.v_proj.weight"];
+const LAYER_QKV_WEIGHT_SUFFIXES: &[&str] = &[
+    "attn_qkv.weight",
+    "attn.qkv.weight",
+    "self_attn.qkv.weight",
+    "self_attn.in_proj_weight",
+    "self_attn.in_proj.weight",
+];
+const LAYER_OUT_WEIGHT_SUFFIXES: &[&str] = &[
+    "attn_out.weight",
+    "attn_output.weight",
+    "self_attn.out_proj.weight",
+    "attn.proj.weight",
+];
+const LAYER_UP_WEIGHT_SUFFIXES: &[&str] = &["ffn_up.weight", "ffn_fc1.weight", "mlp.fc1.weight"];
+const LAYER_DOWN_WEIGHT_SUFFIXES: &[&str] =
+    &["ffn_down.weight", "ffn_fc2.weight", "mlp.fc2.weight"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VitActivation {
@@ -455,6 +499,14 @@ impl ArchRecipe for ClipVisionRecipe {
         is_supported_vision_quant(quant)
     }
 
+    fn validate_model(
+        &self,
+        metadata: &ModelMetadata,
+        weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        validate_vit_model(&self.as_vit_config(), metadata, weights)
+    }
+
     fn forward_classify(
         &self,
         ctx: &mut ExecutionContext<'_>,
@@ -789,6 +841,14 @@ impl ArchRecipe for SiglipVisionRecipe {
         is_supported_vision_quant(quant)
     }
 
+    fn validate_model(
+        &self,
+        metadata: &ModelMetadata,
+        weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        validate_vit_model(&self.as_vit_config(), metadata, weights)
+    }
+
     fn forward_classify(
         &self,
         ctx: &mut ExecutionContext<'_>,
@@ -960,7 +1020,10 @@ fn hydrate_vit_fields(
         fields.projection_dim = Some(proj_dim);
     }
 
-    if let Some(eps) = metadata.rms_norm_eps() {
+    if let Some(eps) = metadata
+        .rms_norm_eps()
+        .filter(|e| e.is_finite() && *e > 0.0)
+    {
         fields.norm_eps = eps;
     }
 
@@ -1171,7 +1234,372 @@ fn validate_encoder_config(cfg: &VitEncoderConfig<'_>) -> Result<usize, K3Error>
             format!("vision norm_eps ({}) must be finite and > 0", cfg.norm_eps),
         ));
     }
+    if cfg.projection_dim == Some(0) {
+        return Err(mismatch_err(
+            cfg.architecture,
+            "vision projection_dim cannot be zero when configured",
+        ));
+    }
     checked_mul(cfg.architecture, cfg.n_heads, cfg.head_dim)
+}
+
+fn validate_vision_architecture(recipe_arch: &str, raw_meta_arch: &str) -> Result<(), K3Error> {
+    let meta = raw_meta_arch.trim().to_ascii_lowercase();
+    if meta.is_empty() || meta == "unknown" {
+        return Ok(());
+    }
+    let compatible = match recipe_arch {
+        "clip" => matches!(
+            meta.as_str(),
+            "clip" | "clip_vision_model" | "clip-vision" | "llava" | "llava-next" | "vision"
+        ),
+        "siglip" => matches!(
+            meta.as_str(),
+            "siglip"
+                | "siglip_vision_model"
+                | "siglip-vision"
+                | "gemma3"
+                | "qwen2_vl"
+                | "qwen2vl"
+                | "qwen2_5_vl"
+                | "paligemma"
+                | "clip"
+                | "clip_vision_model"
+                | "vision"
+        ),
+        _ => false,
+    };
+    if !compatible {
+        return Err(mismatch_err(
+            recipe_arch,
+            format!(
+                "incompatible architecture metadata '{raw_meta_arch}' for '{recipe_arch}' recipe"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vit_model(
+    cfg: &VitEncoderConfig<'_>,
+    metadata: &ModelMetadata,
+    weights: &dyn ModelWeights,
+) -> Result<(), K3Error> {
+    let attn_dim = validate_encoder_config(cfg)?;
+    validate_vision_architecture(cfg.architecture, metadata.architecture())?;
+
+    for desc in metadata.tensors() {
+        if !is_supported_vision_quant(desc.quant()) {
+            return Err(K3Error::unsupported_tensor_quant(
+                metadata.architecture(),
+                desc.name(),
+                desc.quant(),
+            ));
+        }
+        if weights.tensor_count() > 0
+            && let Ok(view) = weights.tensor(desc.name())
+            && !is_supported_vision_quant(view.quant())
+        {
+            return Err(K3Error::unsupported_tensor_quant(
+                metadata.architecture(),
+                view.name(),
+                view.quant(),
+            ));
+        }
+    }
+
+    if weights.tensor_count() == 0 {
+        return Ok(());
+    }
+
+    validate_vit_stem_and_head(cfg, weights)?;
+    for layer in 0..cfg.num_layers {
+        validate_vit_layer_weights(cfg, weights, layer, attn_dim)?;
+    }
+    validate_optional_map_head(cfg, weights, attn_dim)?;
+    Ok(())
+}
+
+fn validate_vit_stem_and_head(
+    cfg: &VitEncoderConfig<'_>,
+    weights: &dyn ModelWeights,
+) -> Result<(), K3Error> {
+    let d = cfg.hidden_dim;
+    let arch = cfg.architecture;
+
+    let patch_view = lookup_first_tensor(weights, PATCH_WEIGHT_ALIASES, "v.patch_embd.weight")?;
+    validate_patch_kernel_shape(cfg, &patch_view)?;
+    validate_view_ready(&patch_view, arch)?;
+    if let Some(patch_b) = lookup_optional_tensor(weights, PATCH_BIAS_ALIASES)? {
+        validate_1d_view(&patch_b, d, arch)?;
+    }
+
+    if cfg.use_cls_token {
+        let cls_view = lookup_first_tensor(weights, CLS_EMBED_ALIASES, "v.class_embd")?;
+        validate_1d_view(&cls_view, d, arch)?;
+    }
+
+    let pos_view = lookup_first_tensor(weights, POS_EMBED_ALIASES, "v.position_embd.weight")?;
+    let num_pos = validate_position_view_shape(cfg, &pos_view)?;
+    validate_view_ready(&pos_view, arch)?;
+    let spatial = if cfg.use_cls_token {
+        num_pos - 1
+    } else {
+        num_pos
+    };
+    let cfg_side = cfg.image_size / cfg.patch_size;
+    if !(cfg_side > 0 && cfg_side * cfg_side == spatial) && exact_isqrt(spatial).is_none() {
+        return Err(bounds_err(
+            pos_view.name(),
+            pos_view.byte_len(),
+            pos_view.byte_len(),
+            format!(
+                "position embedding '{}' spatial token count {spatial} does not form a valid 2D patch grid",
+                pos_view.name()
+            ),
+        ));
+    }
+
+    if let Some(pre_w) = lookup_optional_tensor(weights, PRE_LN_WEIGHT_ALIASES)? {
+        validate_1d_view(&pre_w, d, arch)?;
+    }
+    if let Some(pre_b) = lookup_optional_tensor(weights, PRE_LN_BIAS_ALIASES)? {
+        validate_1d_view(&pre_b, d, arch)?;
+    }
+
+    let post_w = lookup_first_tensor(weights, POST_LN_WEIGHT_ALIASES, "v.post_ln.weight")?;
+    validate_1d_view(&post_w, d, arch)?;
+    if let Some(post_b) = lookup_optional_tensor(weights, POST_LN_BIAS_ALIASES)? {
+        validate_1d_view(&post_b, d, arch)?;
+    }
+
+    if let Some(proj_w) = lookup_optional_tensor(weights, VISUAL_PROJ_WEIGHT_ALIASES)? {
+        validate_view_ready(&proj_w, arch)?;
+        let out_dim = if let Some(expected_proj) = cfg.projection_dim {
+            validate_2d_linear_shape(&proj_w, expected_proj, d)?;
+            expected_proj
+        } else {
+            infer_2d_other_dim(&proj_w, d, "visual_projection")?
+        };
+        if let Some(proj_b) = lookup_optional_tensor(weights, VISUAL_PROJ_BIAS_ALIASES)? {
+            validate_1d_view(&proj_b, out_dim, arch)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_layer_1d(
+    weights: &dyn ModelWeights,
+    layer: usize,
+    suffixes: &[&str],
+    expected_len: usize,
+    arch: &str,
+) -> Result<(), K3Error> {
+    let candidates = layer_aliases(layer, suffixes);
+    let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    if let Some(view) = lookup_optional_tensor(weights, &refs)? {
+        validate_1d_view(&view, expected_len, arch)?;
+    }
+    Ok(())
+}
+
+fn validate_vit_layer_weights(
+    cfg: &VitEncoderConfig<'_>,
+    weights: &dyn ModelWeights,
+    layer: usize,
+    attn_dim: usize,
+) -> Result<(), K3Error> {
+    let d = cfg.hidden_dim;
+    let arch = cfg.architecture;
+
+    let ln1_w = lookup_layer_tensor(
+        weights,
+        layer,
+        LAYER_LN1_WEIGHT_SUFFIXES,
+        &format!("v.blk.{layer}.ln1.weight"),
+    )?;
+    validate_1d_view(&ln1_w, d, arch)?;
+    validate_optional_layer_1d(weights, layer, LAYER_LN1_BIAS_SUFFIXES, d, arch)?;
+
+    let q_cands = layer_aliases(layer, LAYER_Q_WEIGHT_SUFFIXES);
+    let q_refs: Vec<&str> = q_cands.iter().map(String::as_str).collect();
+    if let Some(q_w) = lookup_optional_tensor(weights, &q_refs)? {
+        validate_2d_linear_shape(&q_w, attn_dim, d)?;
+        validate_view_ready(&q_w, arch)?;
+        for (sufs, name) in [
+            (
+                LAYER_K_WEIGHT_SUFFIXES,
+                format!("v.blk.{layer}.attn_k.weight"),
+            ),
+            (
+                LAYER_V_WEIGHT_SUFFIXES,
+                format!("v.blk.{layer}.attn_v.weight"),
+            ),
+        ] {
+            let w = lookup_layer_tensor(weights, layer, sufs, &name)?;
+            validate_2d_linear_shape(&w, attn_dim, d)?;
+            validate_view_ready(&w, arch)?;
+        }
+    } else {
+        let qkv_w = lookup_layer_tensor(
+            weights,
+            layer,
+            LAYER_QKV_WEIGHT_SUFFIXES,
+            &format!("v.blk.{layer}.attn_q.weight"),
+        )?;
+        let fused_out = checked_mul(qkv_w.name(), 3, attn_dim)?;
+        validate_2d_linear_shape(&qkv_w, fused_out, d)?;
+        validate_view_ready(&qkv_w, arch)?;
+    }
+
+    let out_w = lookup_layer_tensor(
+        weights,
+        layer,
+        LAYER_OUT_WEIGHT_SUFFIXES,
+        &format!("v.blk.{layer}.attn_out.weight"),
+    )?;
+    validate_2d_linear_shape(&out_w, d, attn_dim)?;
+    validate_view_ready(&out_w, arch)?;
+
+    let ln2_w = lookup_layer_tensor(
+        weights,
+        layer,
+        LAYER_LN2_WEIGHT_SUFFIXES,
+        &format!("v.blk.{layer}.ln2.weight"),
+    )?;
+    validate_1d_view(&ln2_w, d, arch)?;
+    validate_optional_layer_1d(weights, layer, LAYER_LN2_BIAS_SUFFIXES, d, arch)?;
+
+    let up_w = lookup_layer_tensor(
+        weights,
+        layer,
+        LAYER_UP_WEIGHT_SUFFIXES,
+        &format!("v.blk.{layer}.ffn_up.weight"),
+    )?;
+    validate_2d_linear_shape(&up_w, cfg.ffn_dim, d)?;
+    validate_view_ready(&up_w, arch)?;
+
+    let down_w = lookup_layer_tensor(
+        weights,
+        layer,
+        LAYER_DOWN_WEIGHT_SUFFIXES,
+        &format!("v.blk.{layer}.ffn_down.weight"),
+    )?;
+    validate_2d_linear_shape(&down_w, d, cfg.ffn_dim)?;
+    validate_view_ready(&down_w, arch)?;
+    Ok(())
+}
+
+fn validate_optional_map_head(
+    cfg: &VitEncoderConfig<'_>,
+    weights: &dyn ModelWeights,
+    attn_dim: usize,
+) -> Result<(), K3Error> {
+    if !cfg.use_map_head {
+        return Ok(());
+    }
+    let Some(probe_w) = lookup_optional_tensor(weights, MAP_PROBE_ALIASES)? else {
+        return Ok(());
+    };
+    let d = cfg.hidden_dim;
+    let arch = cfg.architecture;
+    validate_1d_view(&probe_w, d, arch)?;
+
+    if let Some(in_proj) = lookup_optional_tensor(
+        weights,
+        &[
+            "v.head.attn_qkv.weight",
+            "v.head.attention.in_proj_weight",
+            "head.attention.in_proj_weight",
+            "vision_model.head.attention.in_proj_weight",
+        ],
+    )? {
+        validate_2d_linear_shape(&in_proj, checked_mul(arch, 3, attn_dim)?, d)?;
+        validate_view_ready(&in_proj, arch)?;
+    } else {
+        for (aliases, name) in [
+            (
+                &[
+                    "v.head.attn_q.weight",
+                    "head.attention.q_proj.weight",
+                    "vision_model.head.attention.q_proj.weight",
+                ][..],
+                "v.head.attn_q.weight",
+            ),
+            (
+                &[
+                    "v.head.attn_k.weight",
+                    "head.attention.k_proj.weight",
+                    "vision_model.head.attention.k_proj.weight",
+                ][..],
+                "v.head.attn_k.weight",
+            ),
+            (
+                &[
+                    "v.head.attn_v.weight",
+                    "head.attention.v_proj.weight",
+                    "vision_model.head.attention.v_proj.weight",
+                ][..],
+                "v.head.attn_v.weight",
+            ),
+        ] {
+            let w = lookup_first_tensor(weights, aliases, name)?;
+            validate_2d_linear_shape(&w, attn_dim, d)?;
+            validate_view_ready(&w, arch)?;
+        }
+    }
+
+    let out_proj = lookup_first_tensor(
+        weights,
+        &[
+            "v.head.attn_out.weight",
+            "v.head.attention.out_proj.weight",
+            "head.attention.out_proj.weight",
+            "vision_model.head.attention.out_proj.weight",
+        ],
+        "v.head.attn_out.weight",
+    )?;
+    validate_2d_linear_shape(&out_proj, d, attn_dim)?;
+    validate_view_ready(&out_proj, arch)?;
+
+    let ln_w = lookup_first_tensor(
+        weights,
+        &[
+            "v.head.ln.weight",
+            "v.head.layernorm.weight",
+            "head.layernorm.weight",
+            "vision_model.head.layernorm.weight",
+        ],
+        "v.head.ln.weight",
+    )?;
+    validate_1d_view(&ln_w, d, arch)?;
+
+    let fc1_w = lookup_first_tensor(
+        weights,
+        &[
+            "v.head.mlp.fc1.weight",
+            "v.head.ffn_up.weight",
+            "head.mlp.fc1.weight",
+            "vision_model.head.mlp.fc1.weight",
+        ],
+        "v.head.mlp.fc1.weight",
+    )?;
+    let head_ffn = infer_2d_other_dim(&fc1_w, d, "MAP head fc1")?;
+    validate_view_ready(&fc1_w, arch)?;
+
+    let fc2_w = lookup_first_tensor(
+        weights,
+        &[
+            "v.head.mlp.fc2.weight",
+            "v.head.ffn_down.weight",
+            "head.mlp.fc2.weight",
+            "vision_model.head.mlp.fc2.weight",
+        ],
+        "v.head.mlp.fc2.weight",
+    )?;
+    validate_2d_linear_shape(&fc2_w, d, head_ffn)?;
+    validate_view_ready(&fc2_w, arch)?;
+    Ok(())
 }
 
 fn validate_vision_input_pixels(
@@ -1346,17 +1774,11 @@ fn embed_patches_and_positions(
     Ok((seq_hidden, seq_len))
 }
 
-fn add_interpolated_positions(
+fn validate_position_view_shape(
     cfg: &VitEncoderConfig<'_>,
-    weights: &dyn ModelWeights,
-    seq_hidden: &mut [f32],
-    patch_offset: usize,
-    dst_grid_h: usize,
-    dst_grid_w: usize,
-    n_patches: usize,
-) -> Result<(), K3Error> {
+    pos_view: &TensorView<'_>,
+) -> Result<usize, K3Error> {
     let hidden_dim = cfg.hidden_dim;
-    let pos_view = lookup_first_tensor(weights, POS_EMBED_ALIASES, "v.position_embd.weight")?;
     if pos_view.num_elements() == 0 || pos_view.num_elements() % hidden_dim != 0 {
         return Err(bounds_err(
             pos_view.name(),
@@ -1390,17 +1812,32 @@ fn add_interpolated_positions(
             ),
         ));
     }
+    if cfg.use_cls_token && num_positions < 2 {
+        return Err(bounds_err(
+            pos_view.name(),
+            2 * hidden_dim * size_of::<f32>(),
+            pos_view.byte_len(),
+            "CLIP position embedding requires at least [CLS] + 1 spatial patch row",
+        ));
+    }
+    Ok(num_positions)
+}
+
+fn add_interpolated_positions(
+    cfg: &VitEncoderConfig<'_>,
+    weights: &dyn ModelWeights,
+    seq_hidden: &mut [f32],
+    patch_offset: usize,
+    dst_grid_h: usize,
+    dst_grid_w: usize,
+    n_patches: usize,
+) -> Result<(), K3Error> {
+    let hidden_dim = cfg.hidden_dim;
+    let pos_view = lookup_first_tensor(weights, POS_EMBED_ALIASES, "v.position_embd.weight")?;
+    validate_position_view_shape(cfg, &pos_view)?;
 
     let pos_data = decode_all_finite(&pos_view, cfg.architecture)?;
     let spatial_pos = if cfg.use_cls_token {
-        if num_positions < 2 {
-            return Err(bounds_err(
-                pos_view.name(),
-                2 * hidden_dim * size_of::<f32>(),
-                pos_view.byte_len(),
-                "CLIP position embedding requires at least [CLS] + 1 spatial patch row",
-            ));
-        }
         for (dst, &p) in seq_hidden[..hidden_dim]
             .iter_mut()
             .zip(pos_data[..hidden_dim].iter())
