@@ -68,12 +68,16 @@ const PRE_LN_WEIGHT_ALIASES: &[&str] = &[
     "pre_ln.weight",
     "vision_model.pre_layrnorm.weight",
     "vision_model.pre_layernorm.weight",
+    "pre_layrnorm.weight",
+    "pre_layernorm.weight",
 ];
 const PRE_LN_BIAS_ALIASES: &[&str] = &[
     "v.pre_ln.bias",
     "pre_ln.bias",
     "vision_model.pre_layrnorm.bias",
     "vision_model.pre_layernorm.bias",
+    "pre_layrnorm.bias",
+    "pre_layernorm.bias",
 ];
 const POST_LN_WEIGHT_ALIASES: &[&str] = &[
     "v.post_ln.weight",
@@ -94,7 +98,12 @@ const VISUAL_PROJ_WEIGHT_ALIASES: &[&str] = &[
     "v.proj.weight",
     "v.visual_projection.weight",
     "visual.proj",
+    "visual.proj.weight",
     "vision_model.visual_projection.weight",
+    "v.proj",
+    "v.visual_projection",
+    "visual_projection",
+    "vision_model.visual_projection",
 ];
 const VISUAL_PROJ_BIAS_ALIASES: &[&str] = &[
     "visual_projection.bias",
@@ -308,6 +317,8 @@ impl ClipVisionRecipe {
                 head_dim: recipe.head_dim,
                 projection_dim: recipe.projection_dim,
                 norm_eps: recipe.norm_eps,
+                image_mean: recipe.image_mean,
+                image_std: recipe.image_std,
             },
         );
         recipe.image_size = hydrated.image_size;
@@ -320,6 +331,8 @@ impl ClipVisionRecipe {
         recipe.head_dim = hydrated.head_dim;
         recipe.projection_dim = hydrated.projection_dim;
         recipe.norm_eps = hydrated.norm_eps;
+        recipe.image_mean = hydrated.image_mean;
+        recipe.image_std = hydrated.image_std;
         recipe
     }
 
@@ -338,6 +351,8 @@ impl ClipVisionRecipe {
             head_dim: recipe.head_dim,
             projection_dim: recipe.projection_dim,
             norm_eps: recipe.norm_eps,
+            image_mean: recipe.image_mean,
+            image_std: recipe.image_std,
         };
         apply_gguf_vision_kvs(gguf, &mut fields, &mut recipe.use_quick_gelu);
         recipe.image_size = fields.image_size;
@@ -350,6 +365,8 @@ impl ClipVisionRecipe {
         recipe.head_dim = fields.head_dim;
         recipe.projection_dim = fields.projection_dim;
         recipe.norm_eps = fields.norm_eps;
+        recipe.image_mean = fields.image_mean;
+        recipe.image_std = fields.image_std;
         recipe
     }
 
@@ -368,6 +385,8 @@ impl ClipVisionRecipe {
             head_dim: recipe.head_dim,
             projection_dim: recipe.projection_dim,
             norm_eps: recipe.norm_eps,
+            image_mean: recipe.image_mean,
+            image_std: recipe.image_std,
         };
         apply_safetensors_vision_meta(st, &mut fields, Some(&mut recipe.use_quick_gelu));
         recipe.image_size = fields.image_size;
@@ -380,6 +399,8 @@ impl ClipVisionRecipe {
         recipe.head_dim = fields.head_dim;
         recipe.projection_dim = fields.projection_dim;
         recipe.norm_eps = fields.norm_eps;
+        recipe.image_mean = fields.image_mean;
+        recipe.image_std = fields.image_std;
         recipe
     }
 
@@ -653,6 +674,8 @@ impl SiglipVisionRecipe {
                 head_dim: recipe.head_dim,
                 projection_dim: recipe.projection_dim,
                 norm_eps: recipe.norm_eps,
+                image_mean: recipe.image_mean,
+                image_std: recipe.image_std,
             },
         );
         recipe.image_size = hydrated.image_size;
@@ -665,6 +688,8 @@ impl SiglipVisionRecipe {
         recipe.head_dim = hydrated.head_dim;
         recipe.projection_dim = hydrated.projection_dim;
         recipe.norm_eps = hydrated.norm_eps;
+        recipe.image_mean = hydrated.image_mean;
+        recipe.image_std = hydrated.image_std;
         recipe
     }
 
@@ -683,6 +708,8 @@ impl SiglipVisionRecipe {
             head_dim: recipe.head_dim,
             projection_dim: recipe.projection_dim,
             norm_eps: recipe.norm_eps,
+            image_mean: recipe.image_mean,
+            image_std: recipe.image_std,
         };
         let mut unused_gelu = false;
         apply_gguf_vision_kvs(gguf, &mut fields, &mut unused_gelu);
@@ -696,6 +723,8 @@ impl SiglipVisionRecipe {
         recipe.head_dim = fields.head_dim;
         recipe.projection_dim = fields.projection_dim;
         recipe.norm_eps = fields.norm_eps;
+        recipe.image_mean = fields.image_mean;
+        recipe.image_std = fields.image_std;
         recipe
     }
 
@@ -714,6 +743,8 @@ impl SiglipVisionRecipe {
             head_dim: recipe.head_dim,
             projection_dim: recipe.projection_dim,
             norm_eps: recipe.norm_eps,
+            image_mean: recipe.image_mean,
+            image_std: recipe.image_std,
         };
         apply_safetensors_vision_meta(st, &mut fields, None);
         recipe.image_size = fields.image_size;
@@ -726,6 +757,8 @@ impl SiglipVisionRecipe {
         recipe.head_dim = fields.head_dim;
         recipe.projection_dim = fields.projection_dim;
         recipe.norm_eps = fields.norm_eps;
+        recipe.image_mean = fields.image_mean;
+        recipe.image_std = fields.image_std;
         recipe
     }
 
@@ -893,6 +926,8 @@ struct VitFields {
     head_dim: usize,
     projection_dim: Option<usize>,
     norm_eps: f32,
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
 }
 
 fn find_desc<'a>(
@@ -1110,6 +1145,33 @@ fn apply_gguf_vision_kvs(gguf: &GgufFile<'_>, fields: &mut VitFields, use_quick_
     {
         *use_quick_gelu = !use_gelu;
     }
+    if let Some(mean) = gguf_f32_triplet(gguf, "clip.vision.image_mean") {
+        fields.image_mean = mean;
+    }
+    if let Some(std) = gguf_f32_triplet(gguf, "clip.vision.image_std")
+        && std.iter().all(|&v| v > 0.0_f32)
+    {
+        fields.image_std = std;
+    }
+}
+
+fn gguf_f32_triplet(gguf: &GgufFile<'_>, key: &str) -> Option<[f32; 3]> {
+    let arr = gguf.metadata_value(key)?.as_array()?;
+    match arr {
+        jero_core::GgufArray::Float32(vals) if vals.len() == 3 => {
+            let out = [vals[0], vals[1], vals[2]];
+            out.iter().all(|v| v.is_finite()).then_some(out)
+        }
+        jero_core::GgufArray::Float64(vals) if vals.len() == 3 => {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "image normalization stats fit f32"
+            )]
+            let out = [vals[0] as f32, vals[1] as f32, vals[2] as f32];
+            out.iter().all(|v| v.is_finite()).then_some(out)
+        }
+        _ => None,
+    }
 }
 
 fn apply_safetensors_vision_meta(
@@ -1124,39 +1186,69 @@ fn apply_safetensors_vision_meta(
                 .filter(|&n| n > 0)
         })
     };
-    if let Some(v) = meta_usize(&["image_size", "vision.image_size"]) {
+    if let Some(v) = meta_usize(&[
+        "image_size",
+        "vision.image_size",
+        "vision_config.image_size",
+    ]) {
         fields.image_size = v;
     }
-    if let Some(v) = meta_usize(&["patch_size", "vision.patch_size"]) {
+    if let Some(v) = meta_usize(&[
+        "patch_size",
+        "vision.patch_size",
+        "vision_config.patch_size",
+    ]) {
         fields.patch_size = v;
     }
-    if let Some(v) = meta_usize(&["hidden_size", "vision.hidden_size"]) {
+    if let Some(v) = meta_usize(&[
+        "hidden_size",
+        "vision.hidden_size",
+        "vision_config.hidden_size",
+    ]) {
         fields.hidden_dim = v;
     }
-    if let Some(v) = meta_usize(&["intermediate_size", "vision.intermediate_size"]) {
+    if let Some(v) = meta_usize(&[
+        "intermediate_size",
+        "vision.intermediate_size",
+        "vision_config.intermediate_size",
+    ]) {
         fields.ffn_dim = v;
     }
-    if let Some(v) = meta_usize(&["num_hidden_layers", "vision.num_hidden_layers"]) {
+    if let Some(v) = meta_usize(&[
+        "num_hidden_layers",
+        "vision.num_hidden_layers",
+        "vision_config.num_hidden_layers",
+    ]) {
         fields.num_layers = v;
     }
-    if let Some(v) = meta_usize(&["num_attention_heads", "vision.num_attention_heads"])
-        && fields.hidden_dim % v == 0
+    if let Some(v) = meta_usize(&[
+        "num_attention_heads",
+        "vision.num_attention_heads",
+        "vision_config.num_attention_heads",
+    ]) && fields.hidden_dim % v == 0
     {
         fields.n_heads = v;
         fields.head_dim = fields.hidden_dim / v;
     }
-    if let Some(v) = meta_usize(&["projection_dim", "vision.projection_dim"]) {
+    if let Some(v) = meta_usize(&[
+        "projection_dim",
+        "vision.projection_dim",
+        "vision_config.projection_dim",
+    ]) {
         fields.projection_dim = Some(v);
     }
-    if let Some(eps) = st
-        .metadata_value("layer_norm_eps")
+    if let Some(eps) = ["layer_norm_eps", "vision_config.layer_norm_eps"]
+        .iter()
+        .find_map(|k| st.metadata_value(k))
         .and_then(|s| s.trim().parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
     {
         fields.norm_eps = eps;
     }
     if let Some(flag) = use_quick_gelu
-        && let Some(act) = st.metadata_value("hidden_act")
+        && let Some(act) = st
+            .metadata_value("hidden_act")
+            .or_else(|| st.metadata_value("vision_config.hidden_act"))
     {
         if act.eq_ignore_ascii_case("quick_gelu") {
             *flag = true;
@@ -1470,23 +1562,7 @@ fn validate_vit_layer_weights(
     validate_1d_view(&ln2_w, d, arch)?;
     validate_optional_layer_1d(weights, layer, LAYER_LN2_BIAS_SUFFIXES, d, arch)?;
 
-    let up_w = lookup_layer_tensor(
-        weights,
-        layer,
-        LAYER_UP_WEIGHT_SUFFIXES,
-        &format!("v.blk.{layer}.ffn_up.weight"),
-    )?;
-    validate_2d_linear_shape(&up_w, cfg.ffn_dim, d)?;
-    validate_view_ready(&up_w, arch)?;
-
-    let down_w = lookup_layer_tensor(
-        weights,
-        layer,
-        LAYER_DOWN_WEIGHT_SUFFIXES,
-        &format!("v.blk.{layer}.ffn_down.weight"),
-    )?;
-    validate_2d_linear_shape(&down_w, d, cfg.ffn_dim)?;
-    validate_view_ready(&down_w, arch)?;
+    let _ = resolve_vit_layer_ffn(cfg, weights, layer)?;
     Ok(())
 }
 
@@ -1945,6 +2021,16 @@ fn lookup_layer_tensor<'w>(
     lookup_first_tensor(weights, &refs, logical_name)
 }
 
+fn lookup_optional_layer_tensor<'w>(
+    weights: &'w dyn ModelWeights,
+    layer: usize,
+    suffixes: &[&str],
+) -> Result<Option<TensorView<'w>>, K3Error> {
+    let candidates = layer_aliases(layer, suffixes);
+    let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    lookup_optional_tensor(weights, &refs)
+}
+
 fn lookup_optional_layer_1d(
     weights: &dyn ModelWeights,
     layer: usize,
@@ -1955,6 +2041,141 @@ fn lookup_optional_layer_1d(
     let candidates = layer_aliases(layer, suffixes);
     let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
     decode_optional_1d(weights, &refs, expected_len, arch)
+}
+
+struct ResolvedVitFfn<'a> {
+    fc1_w: TensorView<'a>,
+    fc1_b: Option<TensorView<'a>>,
+    fc2_w: TensorView<'a>,
+    fc2_b: Option<TensorView<'a>>,
+}
+
+fn weights_indicate_gguf_layout(
+    weights: &dyn ModelWeights,
+    cfg: &VitEncoderConfig<'_>,
+    layer: usize,
+) -> bool {
+    let d = cfg.hidden_dim;
+    let p = cfg.patch_size;
+    let c = cfg.in_channels;
+    if let Ok(Some(patch)) = lookup_optional_tensor(weights, PATCH_WEIGHT_ALIASES) {
+        let s = patch.shape();
+        if s.len() == 4 && s == [p, p, c, d] && s != [d, c, p, p] {
+            return true;
+        }
+        if s.len() == 4 && s == [d, c, p, p] && s != [p, p, c, d] {
+            return false;
+        }
+    }
+    if let Ok(Some(pos)) = lookup_optional_tensor(weights, POS_EMBED_ALIASES) {
+        let s = pos.shape();
+        if s.len() == 2 && s[0] == d && s[1] != d {
+            return true;
+        }
+        if s.len() == 2 && s[1] == d && s[0] != d {
+            return false;
+        }
+    }
+    if let Ok(Some(qkv)) = lookup_optional_layer_tensor(weights, layer, LAYER_QKV_WEIGHT_SUFFIXES) {
+        let s = qkv.shape();
+        if s.len() == 2 && s[0] == d && s[1] == 3 * d {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolves layer FFN weight & bias views, transparently fixing legacy `clip.cpp` GGUF exports
+/// (including Gemma-3 `mmproj`) where `v.blk.{l}.ffn_up.{weight,bias}` and
+/// `v.blk.{l}.ffn_down.{weight,bias}` are swapped while failing closed on malformed shapes.
+fn resolve_vit_layer_ffn<'a>(
+    cfg: &VitEncoderConfig<'_>,
+    weights: &'a dyn ModelWeights,
+    layer: usize,
+) -> Result<ResolvedVitFfn<'a>, K3Error> {
+    let d = cfg.hidden_dim;
+    let f = cfg.ffn_dim;
+    let arch = cfg.architecture;
+
+    let up_w = lookup_layer_tensor(
+        weights,
+        layer,
+        LAYER_UP_WEIGHT_SUFFIXES,
+        &format!("v.blk.{layer}.ffn_up.weight"),
+    )?;
+    let down_w = lookup_layer_tensor(
+        weights,
+        layer,
+        LAYER_DOWN_WEIGHT_SUFFIXES,
+        &format!("v.blk.{layer}.ffn_down.weight"),
+    )?;
+
+    validate_2d_linear_shape(&up_w, f, d)?;
+    validate_2d_linear_shape(&down_w, d, f)?;
+
+    if d != f && up_w.shape() == down_w.shape() {
+        return Err(bounds_err(
+            up_w.name(),
+            up_w.byte_len(),
+            down_w.byte_len(),
+            format!(
+                "FFN weights '{}' and '{}' cannot both have shape {:?} when hidden_dim ({d}) != ffn_dim ({f})",
+                up_w.name(),
+                down_w.name(),
+                up_w.shape()
+            ),
+        ));
+    }
+
+    let up_b = lookup_optional_layer_tensor(
+        weights,
+        layer,
+        &["ffn_up.bias", "ffn_fc1.bias", "mlp.fc1.bias"],
+    )?;
+    let down_b = lookup_optional_layer_tensor(
+        weights,
+        layer,
+        &["ffn_down.bias", "ffn_fc2.bias", "mlp.fc2.bias"],
+    )?;
+
+    let is_gguf_ffn_pair =
+        up_w.name().ends_with("ffn_up.weight") && down_w.name().ends_with("ffn_down.weight");
+    let swapped =
+        if d != f && is_gguf_ffn_pair && up_w.shape() == [f, d] && down_w.shape() == [d, f] {
+            let up_b_len = up_b.as_ref().map(TensorView::num_elements);
+            let down_b_len = down_b.as_ref().map(TensorView::num_elements);
+            if up_b_len == Some(d) || down_b_len == Some(f) {
+                true
+            } else if up_b_len == Some(f) || down_b_len == Some(d) {
+                false
+            } else {
+                weights_indicate_gguf_layout(weights, cfg, layer)
+            }
+        } else {
+            false
+        };
+
+    let (fc1_w, fc1_b, fc2_w, fc2_b) = if swapped {
+        (down_w, down_b, up_w, up_b)
+    } else {
+        (up_w, up_b, down_w, down_b)
+    };
+
+    validate_view_ready(&fc1_w, arch)?;
+    validate_view_ready(&fc2_w, arch)?;
+    if let Some(b) = &fc1_b {
+        validate_1d_view(b, f, arch)?;
+    }
+    if let Some(b) = &fc2_b {
+        validate_1d_view(b, d, arch)?;
+    }
+
+    Ok(ResolvedVitFfn {
+        fc1_w,
+        fc1_b,
+        fc2_w,
+        fc2_b,
+    })
 }
 
 #[expect(
@@ -2239,21 +2460,14 @@ fn run_vit_layer(
         cfg.norm_eps,
     )?;
 
-    // 6. MLP (`ffn_up` -> QuickGELU / GELU_tanh -> `ffn_down`) + Residual
-    let ffn_up_view = lookup_layer_tensor(
-        weights,
-        layer,
-        &["ffn_up.weight", "ffn_fc1.weight", "mlp.fc1.weight"],
-        &format!("v.blk.{layer}.ffn_up.weight"),
-    )?;
-    let ffn_up_mat = MatrixSlice::from_view(&ffn_up_view, cfg.ffn_dim, hidden_dim)?;
-    let ffn_up_bias = lookup_optional_layer_1d(
-        weights,
-        layer,
-        &["ffn_up.bias", "ffn_fc1.bias", "mlp.fc1.bias"],
-        cfg.ffn_dim,
-        arch,
-    )?;
+    // 6. MLP (`ffn_up` -> QuickGELU / GELU_tanh -> `ffn_down`, handling swapped GGUF naming) + Residual
+    let ffn = resolve_vit_layer_ffn(cfg, weights, layer)?;
+    let ffn_up_mat = MatrixSlice::from_view(&ffn.fc1_w, cfg.ffn_dim, hidden_dim)?;
+    let ffn_up_bias = ffn
+        .fc1_b
+        .as_ref()
+        .map(|v| decode_1d_view(v, cfg.ffn_dim, arch))
+        .transpose()?;
     linear_forward_seq(
         &mut scratch.mlp_hidden,
         &ffn_up_mat,
@@ -2270,20 +2484,12 @@ fn run_vit_layer(
         VitActivation::GeluTanh => gelu_inplace_f32(&mut scratch.mlp_hidden)?,
     }
 
-    let ffn_down_view = lookup_layer_tensor(
-        weights,
-        layer,
-        &["ffn_down.weight", "ffn_fc2.weight", "mlp.fc2.weight"],
-        &format!("v.blk.{layer}.ffn_down.weight"),
-    )?;
-    let ffn_down_mat = MatrixSlice::from_view(&ffn_down_view, hidden_dim, cfg.ffn_dim)?;
-    let ffn_down_bias = lookup_optional_layer_1d(
-        weights,
-        layer,
-        &["ffn_down.bias", "ffn_fc2.bias", "mlp.fc2.bias"],
-        hidden_dim,
-        arch,
-    )?;
+    let ffn_down_mat = MatrixSlice::from_view(&ffn.fc2_w, hidden_dim, cfg.ffn_dim)?;
+    let ffn_down_bias = ffn
+        .fc2_b
+        .as_ref()
+        .map(|v| decode_1d_view(v, hidden_dim, arch))
+        .transpose()?;
     linear_forward_seq(
         &mut scratch.residual_proj,
         &ffn_down_mat,

@@ -150,6 +150,23 @@ impl SharedClipWeights {
         vis_proj: usize,
         llm_dim: usize,
     ) -> Vec<u8> {
+        self.to_gguf_bytes_with_heads(hidden, ffn, patch, base_img, vis_proj, llm_dim, 2)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test builder takes vision geometry, projection widths, and head count"
+    )]
+    fn to_gguf_bytes_with_heads(
+        &self,
+        hidden: usize,
+        ffn: usize,
+        patch: usize,
+        base_img: usize,
+        vis_proj: usize,
+        llm_dim: usize,
+        n_heads: usize,
+    ) -> Vec<u8> {
         let num_pos = (base_img / patch) * (base_img / patch) + 1;
         let kvs = [
             (
@@ -169,7 +186,10 @@ impl SharedClipWeights {
                 GgufValue::Uint32(u32::try_from(ffn).expect("u32")),
             ),
             ("clip.vision.block_count", GgufValue::Uint32(1)),
-            ("clip.vision.attention.head_count", GgufValue::Uint32(2)),
+            (
+                "clip.vision.attention.head_count",
+                GgufValue::Uint32(u32::try_from(n_heads).expect("u32")),
+            ),
             (
                 "clip.vision.projection_dim",
                 GgufValue::Uint32(u32::try_from(vis_proj).expect("u32")),
@@ -1018,4 +1038,550 @@ fn single_layer_linear_projector_and_corrupted_weight_rejection_work() {
         bridge.encode_image_to_soft_prompt(&nan_weights, &pixels, 3, 4, 4),
         Err(K3Error::TensorBoundsError { .. })
     ));
+}
+
+fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = i32::try_from((bits >> 23) & 0xFF).expect("8-bit exp fits i32");
+    let frac = bits & 0x007F_FFFF;
+    if exp == 0 {
+        return sign;
+    }
+    let unbiased = exp - 127;
+    if unbiased < -14 {
+        return sign;
+    }
+    if unbiased > 15 {
+        return sign | 0x7C00;
+    }
+    let h_exp = u16::try_from(unbiased + 15).expect("f16 exp fits u16");
+    let h_frac = u16::try_from(frac >> 13).expect("f16 frac fits u16");
+    sign | (h_exp << 10) | h_frac
+}
+
+fn f32_to_f16_le_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 2);
+    for &v in vals {
+        out.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+    }
+    out
+}
+
+fn quantize_roundtrip_f16(vals: &[f32]) -> Vec<f32> {
+    vals.iter()
+        .map(|&v| {
+            let bits = f32_to_f16_bits(v);
+            let sign = u32::from((bits >> 15) & 1);
+            let exp = u32::from((bits >> 10) & 0x1F);
+            let mant = u32::from(bits & 0x03FF);
+            if exp == 0 {
+                f32::from_bits(sign << 31)
+            } else {
+                f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
+            }
+        })
+        .collect()
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "parity test compares full upstream Gemma-3 GGUF (F16 + swapped FFN) against HF SafeTensors"
+)]
+#[test]
+fn gemma3_gguf_mmproj_swapped_ffn_and_avg_pool_parity_with_safetensors() {
+    let hidden = 8usize;
+    let ffn = 16usize;
+    let patch = 2usize;
+    let img_side = 16usize;
+    let grid = img_side / patch; // 8x8 -> 4x4 avg-pool -> 2x2 = 4 tokens
+    let num_pos = grid * grid;
+    let llm_dim = 12usize;
+
+    let patch_w = pattern_vec(hidden * 3 * patch * patch, 201);
+    let patch_b = pattern_vec(hidden, 202);
+    let pos_w = pattern_vec(num_pos * hidden, 203);
+    let ones = vec![1.0_f32; hidden];
+    let zeros = vec![0.0_f32; hidden];
+    let q_w = quantize_roundtrip_f16(&pattern_vec(hidden * hidden, 204));
+    let q_b = pattern_vec(hidden, 205);
+    let k_w = quantize_roundtrip_f16(&pattern_vec(hidden * hidden, 206));
+    let k_b = pattern_vec(hidden, 207);
+    let v_w = quantize_roundtrip_f16(&pattern_vec(hidden * hidden, 208));
+    let v_b = pattern_vec(hidden, 209);
+    let o_w = quantize_roundtrip_f16(&pattern_vec(hidden * hidden, 210));
+    let o_b = pattern_vec(hidden, 211);
+    let fc1_w = quantize_roundtrip_f16(&pattern_vec(ffn * hidden, 212));
+    let fc1_b = pattern_vec(ffn, 213);
+    let fc2_w = quantize_roundtrip_f16(&pattern_vec(hidden * ffn, 214));
+    let fc2_b = pattern_vec(hidden, 215);
+    let soft_norm_w: Vec<f32> = pattern_vec(hidden, 216)
+        .into_iter()
+        .map(|v| 1.0 + v * 0.5)
+        .collect();
+    // Transposed [in=hidden, out=llm_dim] row-major weight matrix
+    let mm_proj_w = quantize_roundtrip_f16(&pattern_vec(hidden * llm_dim, 217));
+
+    // 1. Upstream llama.cpp Gemma-3 GGUF (F16 linear/proj weights, swapped ffn_up/ffn_down,
+    //    mm.soft_emb_norm.weight, transposed mm.input_projection.weight [llm_dim, hidden], no spatial_merge_size KV)
+    let kvs = [
+        ("clip.vision.image_size", GgufValue::Uint32(16)),
+        ("clip.vision.patch_size", GgufValue::Uint32(2)),
+        ("clip.vision.embedding_length", GgufValue::Uint32(8)),
+        ("clip.vision.feed_forward_length", GgufValue::Uint32(16)),
+        ("clip.vision.projection_dim", GgufValue::Uint32(12)),
+        ("clip.vision.block_count", GgufValue::Uint32(1)),
+        ("clip.vision.attention.head_count", GgufValue::Uint32(2)),
+        (
+            "clip.vision.attention.layer_norm_epsilon",
+            GgufValue::Float32(1e-6),
+        ),
+        ("clip.projector_type", GgufValue::String("gemma3")),
+        ("clip.use_gelu", GgufValue::Bool(true)),
+    ];
+    let gguf_specs: Vec<(&str, QuantType, Vec<usize>, Vec<u8>)> = vec![
+        (
+            "v.patch_embd.weight",
+            QuantType::F32,
+            vec![patch, patch, 3, hidden],
+            f32_to_le_bytes(&patch_w),
+        ),
+        (
+            "v.patch_embd.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&patch_b),
+        ),
+        (
+            "v.position_embd.weight",
+            QuantType::F32,
+            vec![hidden, num_pos],
+            f32_to_le_bytes(&pos_w),
+        ),
+        (
+            "v.blk.0.attn_q.weight",
+            QuantType::F16,
+            vec![hidden, hidden],
+            f32_to_f16_le_bytes(&q_w),
+        ),
+        (
+            "v.blk.0.attn_q.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&q_b),
+        ),
+        (
+            "v.blk.0.attn_k.weight",
+            QuantType::F16,
+            vec![hidden, hidden],
+            f32_to_f16_le_bytes(&k_w),
+        ),
+        (
+            "v.blk.0.attn_k.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&k_b),
+        ),
+        (
+            "v.blk.0.attn_v.weight",
+            QuantType::F16,
+            vec![hidden, hidden],
+            f32_to_f16_le_bytes(&v_w),
+        ),
+        (
+            "v.blk.0.attn_v.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&v_b),
+        ),
+        (
+            "v.blk.0.attn_out.weight",
+            QuantType::F16,
+            vec![hidden, hidden],
+            f32_to_f16_le_bytes(&o_w),
+        ),
+        (
+            "v.blk.0.attn_out.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&o_b),
+        ),
+        (
+            "v.blk.0.ln1.weight",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&ones),
+        ),
+        (
+            "v.blk.0.ln1.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&zeros),
+        ),
+        // Swapped FFN per upstream clip.cpp Gemma-3 export:
+        // ffn_up holds [ffn, hidden] (fc2) with [hidden] bias; ffn_down holds [hidden, ffn] (fc1) with [ffn] bias
+        (
+            "v.blk.0.ffn_up.weight",
+            QuantType::F16,
+            vec![ffn, hidden],
+            f32_to_f16_le_bytes(&fc2_w),
+        ),
+        (
+            "v.blk.0.ffn_up.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&fc2_b),
+        ),
+        (
+            "v.blk.0.ffn_down.weight",
+            QuantType::F16,
+            vec![hidden, ffn],
+            f32_to_f16_le_bytes(&fc1_w),
+        ),
+        (
+            "v.blk.0.ffn_down.bias",
+            QuantType::F32,
+            vec![ffn],
+            f32_to_le_bytes(&fc1_b),
+        ),
+        (
+            "v.blk.0.ln2.weight",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&ones),
+        ),
+        (
+            "v.blk.0.ln2.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&zeros),
+        ),
+        (
+            "v.post_ln.weight",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&ones),
+        ),
+        (
+            "v.post_ln.bias",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&zeros),
+        ),
+        (
+            "mm.soft_emb_norm.weight",
+            QuantType::F32,
+            vec![hidden],
+            f32_to_le_bytes(&soft_norm_w),
+        ),
+        (
+            "mm.input_projection.weight",
+            QuantType::F16,
+            vec![llm_dim, hidden],
+            f32_to_f16_le_bytes(&mm_proj_w),
+        ),
+    ];
+    let gguf_schema: Vec<(&str, QuantType, &[usize])> = gguf_specs
+        .iter()
+        .map(|(n, q, s, _)| (*n, *q, s.as_slice()))
+        .collect();
+    let mut gguf_bytes = create_synthetic_gguf_v3_with_kvs("clip", 1, &kvs, &gguf_schema);
+    let gguf_ranges: Vec<(usize, usize)> = {
+        let parsed = GgufFile::parse(&gguf_bytes).expect("parse layout");
+        gguf_specs
+            .iter()
+            .map(|(n, _, _, _)| {
+                let tv = parsed.tensor(n).expect("tensor present");
+                (tv.offset(), tv.byte_len())
+            })
+            .collect()
+    };
+    for ((off, len), (_, _, _, payload)) in gguf_ranges.into_iter().zip(gguf_specs.iter()) {
+        assert_eq!(payload.len(), len);
+        gguf_bytes[off..off + len].copy_from_slice(payload);
+    }
+    let gguf = GgufFile::parse(&gguf_bytes).expect("parse gemma3 gguf");
+
+    // 2. Reference HF SafeTensors Gemma-3 layout (unswapped mlp.fc1/fc2, mm_soft_emb_norm, mm_input_projection_weight [hidden, llm_dim])
+    let mut st_owned = Vec::new();
+    for (name, shape, vals) in [
+        (
+            "vision_model.embeddings.patch_embedding.weight",
+            vec![hidden, 3, patch, patch],
+            &patch_w,
+        ),
+        (
+            "vision_model.embeddings.patch_embedding.bias",
+            vec![hidden],
+            &patch_b,
+        ),
+        (
+            "vision_model.embeddings.position_embedding.weight",
+            vec![num_pos, hidden],
+            &pos_w,
+        ),
+        (
+            "vision_model.encoder.layers.0.self_attn.q_proj.weight",
+            vec![hidden, hidden],
+            &q_w,
+        ),
+        (
+            "vision_model.encoder.layers.0.self_attn.q_proj.bias",
+            vec![hidden],
+            &q_b,
+        ),
+        (
+            "vision_model.encoder.layers.0.self_attn.k_proj.weight",
+            vec![hidden, hidden],
+            &k_w,
+        ),
+        (
+            "vision_model.encoder.layers.0.self_attn.k_proj.bias",
+            vec![hidden],
+            &k_b,
+        ),
+        (
+            "vision_model.encoder.layers.0.self_attn.v_proj.weight",
+            vec![hidden, hidden],
+            &v_w,
+        ),
+        (
+            "vision_model.encoder.layers.0.self_attn.v_proj.bias",
+            vec![hidden],
+            &v_b,
+        ),
+        (
+            "vision_model.encoder.layers.0.self_attn.out_proj.weight",
+            vec![hidden, hidden],
+            &o_w,
+        ),
+        (
+            "vision_model.encoder.layers.0.self_attn.out_proj.bias",
+            vec![hidden],
+            &o_b,
+        ),
+        (
+            "vision_model.encoder.layers.0.layer_norm1.weight",
+            vec![hidden],
+            &ones,
+        ),
+        (
+            "vision_model.encoder.layers.0.layer_norm1.bias",
+            vec![hidden],
+            &zeros,
+        ),
+        (
+            "vision_model.encoder.layers.0.mlp.fc1.weight",
+            vec![ffn, hidden],
+            &fc1_w,
+        ),
+        (
+            "vision_model.encoder.layers.0.mlp.fc1.bias",
+            vec![ffn],
+            &fc1_b,
+        ),
+        (
+            "vision_model.encoder.layers.0.mlp.fc2.weight",
+            vec![hidden, ffn],
+            &fc2_w,
+        ),
+        (
+            "vision_model.encoder.layers.0.mlp.fc2.bias",
+            vec![hidden],
+            &fc2_b,
+        ),
+        (
+            "vision_model.encoder.layers.0.layer_norm2.weight",
+            vec![hidden],
+            &ones,
+        ),
+        (
+            "vision_model.encoder.layers.0.layer_norm2.bias",
+            vec![hidden],
+            &zeros,
+        ),
+        ("vision_model.post_layernorm.weight", vec![hidden], &ones),
+        ("vision_model.post_layernorm.bias", vec![hidden], &zeros),
+        (
+            "multi_modal_projector.mm_soft_emb_norm.weight",
+            vec![hidden],
+            &soft_norm_w,
+        ),
+        (
+            "multi_modal_projector.mm_input_projection_weight",
+            vec![hidden, llm_dim],
+            &mm_proj_w,
+        ),
+    ] {
+        push_st_f32(&mut st_owned, name, shape, vals);
+    }
+    let st_refs: Vec<(&str, QuantType, &[usize], &[u8])> = st_owned
+        .iter()
+        .map(|(n, s, b)| (*n, QuantType::F32, s.as_slice(), b.as_slice()))
+        .collect();
+    let st_bytes = create_synthetic_safetensors(
+        &[
+            ("general.architecture", "gemma3"),
+            ("num_attention_heads", "2"),
+            ("text_config.hidden_size", "12"),
+        ],
+        &st_refs,
+    );
+    let st = SafeTensorsFile::from_bytes(&st_bytes).expect("parse gemma3 st");
+
+    let bridge_g = VlmMmprojBridge::from_gguf(&gguf);
+    let bridge_s = VlmMmprojBridge::from_safetensors(&st);
+    assert_eq!(bridge_g.spatial_avg_pool, Some(4));
+    assert_eq!(bridge_s.spatial_avg_pool, Some(4));
+    assert!(!bridge_g.merge_2x2_pixel_shuffle);
+    assert!(!bridge_s.merge_2x2_pixel_shuffle);
+    assert_eq!(bridge_g.llm_embed_dim, Some(12));
+    assert_eq!(bridge_s.llm_embed_dim, Some(12));
+
+    let src_hwc = pattern_vec(16 * 16 * 3, 218);
+    let (sp_g, n_g, d_g) = bridge_g
+        .encode_rgb_hwc_to_soft_prompt(&gguf, &src_hwc, 16, 16, 16, 16)
+        .expect("gemma3 gguf forward");
+    let (sp_s, n_s, d_s) = bridge_s
+        .encode_rgb_hwc_to_soft_prompt(&st, &src_hwc, 16, 16, 16, 16)
+        .expect("gemma3 st forward");
+    assert_eq!((n_g, d_g), (4, 12));
+    assert_eq!((n_s, d_s), (4, 12));
+    assert!(
+        max_abs_diff(&sp_g, &sp_s) < 1e-4,
+        "Gemma-3 GGUF vs SafeTensors soft-prompt diverged: max_diff={}",
+        max_abs_diff(&sp_g, &sp_s)
+    );
+}
+
+fn build_hf_clip_safetensors(
+    shared: &SharedClipWeights,
+    hidden: usize,
+    ffn: usize,
+    patch: usize,
+    grid: usize,
+    vis_proj: usize,
+) -> Vec<u8> {
+    let mut st_owned = Vec::new();
+    let num_pos = grid * grid + 1;
+    for (name, shape, vals) in [
+        (
+            "vision_model.embeddings.patch_embedding.weight",
+            vec![hidden, 3, patch, patch],
+            &shared.patch_w,
+        ),
+        (
+            "vision_model.embeddings.patch_embedding.bias",
+            vec![hidden],
+            &shared.patch_b,
+        ),
+        (
+            "vision_model.embeddings.class_embedding",
+            vec![hidden],
+            &shared.cls_w,
+        ),
+        (
+            "vision_model.embeddings.position_embedding.weight",
+            vec![num_pos, hidden],
+            &shared.pos_w,
+        ),
+        (
+            "vision_model.pre_layrnorm.weight",
+            vec![hidden],
+            &shared.ones,
+        ),
+        (
+            "vision_model.pre_layrnorm.bias",
+            vec![hidden],
+            &shared.zeros,
+        ),
+    ] {
+        push_st_f32(&mut st_owned, name, shape, vals);
+    }
+    shared.push_st_layer0(&mut st_owned, hidden, ffn);
+    for (name, shape, vals) in [
+        (
+            "vision_model.post_layernorm.weight",
+            vec![hidden],
+            &shared.ones,
+        ),
+        (
+            "vision_model.post_layernorm.bias",
+            vec![hidden],
+            &shared.zeros,
+        ),
+        (
+            "visual_projection.weight",
+            vec![vis_proj, hidden],
+            &shared.vis_proj_w,
+        ),
+        (
+            "text_model.embeddings.token_embedding.weight",
+            vec![32, 16],
+            &pattern_vec(32 * 16, 301),
+        ),
+        (
+            "text_model.encoder.layers.0.mlp.fc1.weight",
+            vec![64, 16],
+            &pattern_vec(64 * 16, 302),
+        ),
+        (
+            "text_model.encoder.layers.1.mlp.fc1.weight",
+            vec![64, 16],
+            &pattern_vec(64 * 16, 303),
+        ),
+    ] {
+        push_st_f32(&mut st_owned, name, shape, vals);
+    }
+    let st_refs: Vec<(&str, QuantType, &[usize], &[u8])> = st_owned
+        .iter()
+        .map(|(n, s, b)| (*n, QuantType::F32, s.as_slice(), b.as_slice()))
+        .collect();
+    create_synthetic_safetensors(&[("format", "pt")], &st_refs)
+}
+
+#[test]
+fn clip_standalone_hf_safetensors_and_gguf_hydration_and_parity() {
+    // Realistic HF CLIPModel SafeTensors: __metadata__ has ONLY format="pt" (no vision dims)
+    // and includes decoy text_model.* tensors with a different hidden_size=16 and 2 layers.
+    let (hidden, ffn, patch, grid, vis_proj) = (8usize, 16usize, 2usize, 2usize, 6usize);
+    let shared = SharedClipWeights::new(hidden, ffn, patch, grid, vis_proj, 12);
+    let hf_st_bytes = build_hf_clip_safetensors(&shared, hidden, ffn, patch, grid, vis_proj);
+    let hf_st = SafeTensorsFile::from_bytes(&hf_st_bytes).expect("parse HF CLIP SafeTensors");
+    let gguf_bytes = shared.to_gguf_bytes_with_heads(hidden, ffn, patch, 4, vis_proj, 12, 4);
+    let gguf = GgufFile::parse(&gguf_bytes).expect("parse CLIP GGUF");
+
+    let clip_st = ClipVisionRecipe::from_safetensors(&hf_st);
+    let clip_gguf = ClipVisionRecipe::from_gguf(&gguf);
+    for (label, recipe) in [("st", &clip_st), ("gguf", &clip_gguf)] {
+        assert_eq!(recipe.image_size, 4, "{label} image_size");
+        assert_eq!(recipe.patch_size, 2, "{label} patch_size");
+        assert_eq!(recipe.num_layers, 1, "{label} num_layers");
+        assert_eq!(recipe.hidden_dim, 8, "{label} hidden_dim");
+        assert_eq!(recipe.ffn_dim, 16, "{label} ffn_dim");
+        assert_eq!(recipe.n_heads, 4, "{label} n_heads");
+        assert_eq!(recipe.projection_dim, Some(6), "{label} projection_dim");
+        assert!(recipe.use_quick_gelu, "{label} quick_gelu");
+    }
+    clip_st
+        .validate_model(hf_st.metadata(), &hf_st)
+        .expect("HF CLIP SafeTensors validate_model");
+    clip_gguf
+        .validate_model(gguf.metadata(), &gguf)
+        .expect("CLIP GGUF validate_model");
+
+    for side in [4usize, 8usize] {
+        let pixels = pattern_vec(3 * side * side, 310 + side);
+        let emb_st = clip_st
+            .encode_image_embedding(&hf_st, &pixels, 3, side, side, EmbeddingPooling::Cls, None)
+            .expect("HF CLIP SafeTensors embed");
+        let emb_g = clip_gguf
+            .encode_image_embedding(&gguf, &pixels, 3, side, side, EmbeddingPooling::Cls, None)
+            .expect("CLIP GGUF embed");
+        assert_eq!(emb_st.len(), vis_proj);
+        assert!(
+            max_abs_diff(&emb_st, &emb_g) < 1e-5,
+            "CLIP HF SafeTensors vs GGUF diverged at {side}x{side}"
+        );
+    }
 }

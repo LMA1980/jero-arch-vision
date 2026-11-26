@@ -9,9 +9,10 @@
 use jero_core::{GgufFile, K3Error, ModelMetadata, ModelWeights, SafeTensorsFile, TensorView};
 
 use crate::kernels::{
-    MatrixSlice, apply_layernorm_seq, bounds_err, checked_mul, decode_1d_view, decode_optional_1d,
-    gelu_inplace_f32, infer_2d_other_dim, linear_forward_seq, lookup_first_tensor,
-    lookup_optional_tensor, mismatch_err, pixel_shuffle_merge_2x2_f32, validate_2d_linear_shape,
+    MatrixSlice, apply_layernorm_seq, apply_rmsnorm_seq, bounds_err, checked_mul, decode_1d_view,
+    decode_optional_1d, gelu_inplace_f32, infer_2d_other_dim, linear_forward_seq,
+    linear_forward_seq_transposed, lookup_first_tensor, lookup_optional_tensor, mismatch_err,
+    pixel_shuffle_merge_2x2_f32, spatial_avg_pool_2d_f32, validate_2d_linear_shape,
     validate_finite_slice,
 };
 use crate::vit::{ClipVisionRecipe, SiglipVisionRecipe, VisionTokens};
@@ -77,10 +78,23 @@ const LINEAR_PROJ_WEIGHT_ALIASES: &[&str] = &[
     "mm.weight",
     "mmproj.weight",
     "mm.input_projection.weight",
+    "mm.input_projection",
     "mm.input_projection_weight",
+    "mm_input_projection_w",
+    "mm_input_projection.weight",
+    "mm_input_proj.weight",
     "multi_modal_projector.mm_input_projection_weight",
+    "multi_modal_projector.mm_input_projection.weight",
 ];
 const LINEAR_PROJ_BIAS_ALIASES: &[&str] = &["mm.bias", "mmproj.bias", "mm.input_projection.bias"];
+
+const SOFT_EMB_NORM_ALIASES: &[&str] = &[
+    "mm.soft_emb_norm.weight",
+    "mm.soft_emb_norm",
+    "mm_soft_emb_norm.weight",
+    "mm_soft_emb_norm",
+    "multi_modal_projector.mm_soft_emb_norm.weight",
+];
 
 const POST_NORM_WEIGHT_ALIASES: &[&str] = &[
     "mm.norm.weight",
@@ -205,8 +219,9 @@ impl From<SiglipVisionRecipe> for VisionEncoderConfig {
 }
 
 /// Bridge converting raw image tensors through a Vision Transformer (`CLIP` or `SigLIP`),
-/// optional `2x2` spatial pixel-shuffle merging, and a multimodal MLP/linear projector into
-/// LLM soft-prompt embeddings `[num_tokens, llm_embed_dim]`.
+/// optional spatial merging (`2x2` pixel-shuffle or `k x k` Gemma-3 average pooling), optional
+/// normalization (`mm.input_norm` `LayerNorm` / `mm.soft_emb_norm` `RMSNorm`), and a multimodal
+/// MLP/linear projector into LLM soft-prompt embeddings `[num_tokens, llm_embed_dim]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VlmMmprojBridge {
     /// Configured `CLIP` or `SigLIP` vision encoder backbone.
@@ -215,9 +230,11 @@ pub struct VlmMmprojBridge {
     pub llm_embed_dim: Option<usize>,
     /// Enables `2x2` spatial token merging (`4x` width, `0.25x` tokens) before projection.
     pub merge_2x2_pixel_shuffle: bool,
+    /// Optional `k x k` 2D spatial average pooling kernel (`Gemma-3` `mmproj` convention).
+    pub spatial_avg_pool: Option<usize>,
     /// Strips a leading `[CLS]` token before spatial merging / projection when present.
     pub drop_cls_token: bool,
-    /// Normalization stability epsilon for optional `mm.input_norm` / `mm.norm` layers.
+    /// Normalization stability epsilon for optional `mm.input_norm` / `mm.soft_emb_norm` / `mm.norm`.
     pub norm_eps: f32,
 }
 
@@ -229,6 +246,7 @@ impl VlmMmprojBridge {
             encoder,
             llm_embed_dim: None,
             merge_2x2_pixel_shuffle: false,
+            spatial_avg_pool: None,
             drop_cls_token: true,
             norm_eps: 1e-6,
         }
@@ -260,6 +278,18 @@ impl VlmMmprojBridge {
             .with_pixel_shuffle_2x2(true)
     }
 
+    /// Creates an upstream `Gemma3` `SigLIP` + `k x k` average-pooling bridge enforcing `llm_embed_dim`.
+    #[must_use]
+    pub const fn new_gemma3_avg_pool(
+        vision: SiglipVisionRecipe,
+        llm_embed_dim: usize,
+        pool_kernel: usize,
+    ) -> Self {
+        Self::new_siglip(vision)
+            .with_llm_embed_dim(llm_embed_dim)
+            .with_spatial_avg_pool(Some(pool_kernel))
+    }
+
     /// Creates a `Qwen2-VL`-style `SigLIP` + `2x2` pixel-shuffle merge bridge enforcing `llm_embed_dim`.
     #[must_use]
     pub const fn new_qwen2_vl(vision: SiglipVisionRecipe, llm_embed_dim: usize) -> Self {
@@ -282,6 +312,13 @@ impl VlmMmprojBridge {
         self
     }
 
+    /// Configures optional `k x k` 2D spatial average pooling before projection (`Gemma3` `mmproj`).
+    #[must_use]
+    pub const fn with_spatial_avg_pool(mut self, kernel_size: Option<usize>) -> Self {
+        self.spatial_avg_pool = kernel_size;
+        self
+    }
+
     /// Controls whether a leading `[CLS]` token is stripped prior to projector execution.
     #[must_use]
     pub const fn with_drop_cls_token(mut self, drop_cls_token: bool) -> Self {
@@ -289,7 +326,7 @@ impl VlmMmprojBridge {
         self
     }
 
-    /// Overrides the epsilon used by optional projector `LayerNorm` layers.
+    /// Overrides the epsilon used by optional projector `LayerNorm` / `RMSNorm` layers.
     #[must_use]
     pub const fn with_norm_eps(mut self, eps: f32) -> Self {
         self.norm_eps = eps;
@@ -300,17 +337,26 @@ impl VlmMmprojBridge {
     #[must_use]
     pub fn from_metadata(metadata: &ModelMetadata) -> Self {
         let arch = metadata.architecture().to_ascii_lowercase();
-        let use_siglip = prefers_siglip(&arch);
-        let merge_2x2 = prefers_pixel_shuffle(&arch);
+        let has_soft_emb_norm = metadata
+            .tensors()
+            .iter()
+            .any(|d| SOFT_EMB_NORM_ALIASES.contains(&d.name()));
+        let use_siglip = prefers_siglip(&arch) || has_soft_emb_norm;
         let encoder = if use_siglip {
             VisionEncoderConfig::Siglip(SiglipVisionRecipe::from_metadata(metadata))
         } else {
             VisionEncoderConfig::Clip(ClipVisionRecipe::from_metadata(metadata))
         };
+        let (merge_2x2, spatial_avg_pool) = if has_soft_emb_norm {
+            (false, Some(4))
+        } else {
+            (prefers_pixel_shuffle(&arch), None)
+        };
         Self {
             encoder,
             llm_embed_dim: None,
             merge_2x2_pixel_shuffle: merge_2x2,
+            spatial_avg_pool,
             drop_cls_token: true,
             norm_eps: 1e-6,
         }
@@ -355,22 +401,15 @@ impl VlmMmprojBridge {
         .ok()
         .flatten()
         .is_some();
+        let has_soft_emb_norm = lookup_optional_tensor(gguf, SOFT_EMB_NORM_ALIASES)
+            .ok()
+            .flatten()
+            .is_some();
 
         let use_siglip = prefers_siglip(&arch)
             || prefers_siglip(&proj_type)
+            || has_soft_emb_norm
             || (!has_cls_tensor && (has_merge_norm || arch.is_empty()));
-
-        let mut merge_2x2 = prefers_pixel_shuffle(&arch) || prefers_pixel_shuffle(&proj_type);
-        if let Some(merge_size) = gguf_usize(
-            gguf,
-            &[
-                "clip.vision.spatial_merge_size",
-                "spatial_merge_size",
-                "vision.spatial_merge_size",
-            ],
-        ) {
-            merge_2x2 = merge_size == 2;
-        }
 
         let llm_embed_dim = gguf_usize(
             gguf,
@@ -390,13 +429,33 @@ impl VlmMmprojBridge {
         } else {
             VisionEncoderConfig::Clip(ClipVisionRecipe::from_gguf(gguf))
         };
+        let merge_size = gguf_usize(
+            gguf,
+            &[
+                "clip.vision.spatial_merge_size",
+                "clip.vision.proj_scale_factor",
+                "clip.vision.pooling_kernel_size",
+                "spatial_merge_size",
+                "vision.spatial_merge_size",
+            ],
+        );
+        let (merge_2x2, spatial_avg_pool) = resolve_spatial_merge_mode(
+            gguf,
+            &arch,
+            &proj_type,
+            encoder.hidden_dim(),
+            merge_size,
+            has_soft_emb_norm,
+            false,
+        );
 
         Self {
             encoder,
             llm_embed_dim,
             merge_2x2_pixel_shuffle: merge_2x2,
+            spatial_avg_pool,
             drop_cls_token: true,
-            norm_eps: 1e-6,
+            norm_eps: gguf_norm_eps(gguf),
         }
     }
 
@@ -426,18 +485,15 @@ impl VlmMmprojBridge {
                 .ok()
                 .flatten()
                 .is_some();
+        let has_soft_emb_norm = lookup_optional_tensor(st, SOFT_EMB_NORM_ALIASES)
+            .ok()
+            .flatten()
+            .is_some();
 
         let use_siglip = prefers_siglip(&arch)
             || prefers_siglip(&proj_type)
+            || has_soft_emb_norm
             || (!has_cls_tensor && has_qwen_merger);
-        let mut merge_2x2 =
-            prefers_pixel_shuffle(&arch) || prefers_pixel_shuffle(&proj_type) || has_qwen_merger;
-        if let Some(merge_size) = st_usize(
-            st,
-            &["spatial_merge_size", "vision_config.spatial_merge_size"],
-        ) {
-            merge_2x2 = merge_size == 2;
-        }
 
         let llm_embed_dim = st_usize(
             st,
@@ -454,11 +510,29 @@ impl VlmMmprojBridge {
         } else {
             VisionEncoderConfig::Clip(ClipVisionRecipe::from_safetensors(st))
         };
+        let merge_size = st_usize(
+            st,
+            &[
+                "spatial_merge_size",
+                "vision_config.spatial_merge_size",
+                "pooling_kernel_size",
+            ],
+        );
+        let (merge_2x2, spatial_avg_pool) = resolve_spatial_merge_mode(
+            st,
+            &arch,
+            &proj_type,
+            encoder.hidden_dim(),
+            merge_size,
+            has_soft_emb_norm,
+            has_qwen_merger,
+        );
 
         Self {
             encoder,
             llm_embed_dim,
             merge_2x2_pixel_shuffle: merge_2x2,
+            spatial_avg_pool,
             drop_cls_token: true,
             norm_eps: 1e-6,
         }
@@ -599,10 +673,13 @@ impl VlmMmprojBridge {
             (vision_tokens.tokens.as_slice(), vision_tokens.seq_len)
         };
 
-        if self.merge_2x2_pixel_shuffle && !self.drop_cls_token && vision_tokens.has_cls_token {
+        if (self.merge_2x2_pixel_shuffle || self.spatial_avg_pool.is_some_and(|k| k > 1))
+            && !self.drop_cls_token
+            && vision_tokens.has_cls_token
+        {
             return Err(mismatch_err(
                 arch,
-                "2x2 pixel-shuffle merging requires dropping [CLS] token (drop_cls_token=true)",
+                "spatial token pooling/merging requires dropping [CLS] token (drop_cls_token=true)",
             ));
         }
 
@@ -618,30 +695,27 @@ impl VlmMmprojBridge {
         )?;
         let pre_merge_tokens = normed_storage.as_deref().unwrap_or(raw_tokens);
 
-        // Optional 2x2 spatial pixel-shuffle merge.
-        let (proj_in_buf, proj_tokens, proj_in_dim) = if self.merge_2x2_pixel_shuffle {
-            let grid_h = vision_tokens.grid_h;
-            let grid_w = vision_tokens.grid_w;
-            if grid_h < 2 || grid_w < 2 || grid_h % 2 != 0 || grid_w % 2 != 0 {
-                return Err(bounds_err(
-                    "mmproj.pixel_shuffle_2x2",
-                    checked_mul("mmproj.pixel_shuffle_2x2", grid_h * grid_w, hidden_dim)?,
-                    pre_merge_tokens.len(),
-                    format!(
-                        "2x2 pixel shuffle requires even patch grid dimensions >= 2, got {grid_h}x{grid_w}"
-                    ),
-                ));
-            }
-            let merged_tokens = (grid_h / 2) * (grid_w / 2);
-            let merged_dim = checked_mul("mmproj.pixel_shuffle_2x2", hidden_dim, 4)?;
-            let mut merged =
-                vec![0.0_f32; checked_mul("mmproj.pixel_shuffle_2x2", merged_tokens, merged_dim)?];
-            pixel_shuffle_merge_2x2_f32(&mut merged, pre_merge_tokens, grid_h, grid_w, hidden_dim)?;
-            (Some(merged), merged_tokens, merged_dim)
-        } else {
-            (None, token_count, hidden_dim)
-        };
-        let proj_input = proj_in_buf.as_deref().unwrap_or(pre_merge_tokens);
+        // Optional 2x2 spatial pixel-shuffle merge or k x k spatial average pooling (Gemma-3).
+        let (proj_in_buf, proj_tokens, proj_in_dim) = self.apply_spatial_pooling(
+            pre_merge_tokens,
+            vision_tokens.grid_h,
+            vision_tokens.grid_w,
+            token_count,
+            hidden_dim,
+        )?;
+        let pre_proj_tokens = proj_in_buf.as_deref().unwrap_or(pre_merge_tokens);
+
+        // Optional Gemma-3 soft-embedding RMSNorm (applied after spatial pooling, before linear projection).
+        let soft_norm_storage = apply_optional_seq_rmsnorm(
+            mmproj_weights,
+            SOFT_EMB_NORM_ALIASES,
+            pre_proj_tokens,
+            proj_tokens,
+            proj_in_dim,
+            self.norm_eps,
+            arch,
+        )?;
+        let proj_input = soft_norm_storage.as_deref().unwrap_or(pre_proj_tokens);
 
         let (mut projected, out_dim) =
             self.run_projector_layers(mmproj_weights, proj_input, proj_tokens, proj_in_dim)?;
@@ -681,6 +755,52 @@ impl VlmMmprojBridge {
         }
         validate_finite_slice("mmproj.soft_prompt", &projected)?;
         Ok((projected, proj_tokens, out_dim))
+    }
+
+    fn apply_spatial_pooling(
+        &self,
+        tokens: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+        token_count: usize,
+        hidden_dim: usize,
+    ) -> Result<(Option<Vec<f32>>, usize, usize), K3Error> {
+        if self.merge_2x2_pixel_shuffle {
+            if grid_h < 2 || grid_w < 2 || grid_h % 2 != 0 || grid_w % 2 != 0 {
+                return Err(bounds_err(
+                    "mmproj.pixel_shuffle_2x2",
+                    checked_mul("mmproj.pixel_shuffle_2x2", grid_h * grid_w, hidden_dim)?,
+                    tokens.len(),
+                    format!(
+                        "2x2 pixel shuffle requires even patch grid dimensions >= 2, got {grid_h}x{grid_w}"
+                    ),
+                ));
+            }
+            let merged_tokens = (grid_h / 2) * (grid_w / 2);
+            let merged_dim = checked_mul("mmproj.pixel_shuffle_2x2", hidden_dim, 4)?;
+            let mut merged =
+                vec![0.0_f32; checked_mul("mmproj.pixel_shuffle_2x2", merged_tokens, merged_dim)?];
+            pixel_shuffle_merge_2x2_f32(&mut merged, tokens, grid_h, grid_w, hidden_dim)?;
+            Ok((Some(merged), merged_tokens, merged_dim))
+        } else if let Some(pool_k) = self.spatial_avg_pool {
+            if grid_h < pool_k || grid_w < pool_k || grid_h % pool_k != 0 || grid_w % pool_k != 0 {
+                return Err(bounds_err(
+                    "mmproj.spatial_avg_pool",
+                    checked_mul("mmproj.spatial_avg_pool", grid_h * grid_w, hidden_dim)?,
+                    tokens.len(),
+                    format!(
+                        "{pool_k}x{pool_k} spatial average pooling requires patch grid dimensions divisible by {pool_k}, got {grid_h}x{grid_w}"
+                    ),
+                ));
+            }
+            let pooled_tokens = (grid_h / pool_k) * (grid_w / pool_k);
+            let mut pooled =
+                vec![0.0_f32; checked_mul("mmproj.spatial_avg_pool", pooled_tokens, hidden_dim)?];
+            spatial_avg_pool_2d_f32(&mut pooled, tokens, grid_h, grid_w, hidden_dim, pool_k)?;
+            Ok((Some(pooled), pooled_tokens, hidden_dim))
+        } else {
+            Ok((None, token_count, hidden_dim))
+        }
     }
 
     fn run_projector_layers(
@@ -751,19 +871,34 @@ impl VlmMmprojBridge {
         } else {
             infer_2d_other_dim(&lin_view, in_dim, "mmproj.linear")?
         };
-        let lin_mat = MatrixSlice::from_view(&lin_view, out_dim, in_dim)?;
+        let is_transposed = linear_proj_is_transposed(weights, &lin_view, in_dim, out_dim);
         let lin_bias = decode_optional_1d(weights, LINEAR_PROJ_BIAS_ALIASES, out_dim, arch)?;
         let mut out = vec![0.0_f32; checked_mul("mmproj.linear.out", num_tokens, out_dim)?];
-        linear_forward_seq(
-            &mut out,
-            &lin_mat,
-            lin_bias.as_deref(),
-            input,
-            num_tokens,
-            in_dim,
-            out_dim,
-            arch,
-        )?;
+        if is_transposed {
+            let lin_mat = MatrixSlice::from_view(&lin_view, in_dim, out_dim)?;
+            linear_forward_seq_transposed(
+                &mut out,
+                &lin_mat,
+                lin_bias.as_deref(),
+                input,
+                num_tokens,
+                in_dim,
+                out_dim,
+                arch,
+            )?;
+        } else {
+            let lin_mat = MatrixSlice::from_view(&lin_view, out_dim, in_dim)?;
+            linear_forward_seq(
+                &mut out,
+                &lin_mat,
+                lin_bias.as_deref(),
+                input,
+                num_tokens,
+                in_dim,
+                out_dim,
+                arch,
+            )?;
+        }
         Ok((out, out_dim))
     }
 
@@ -773,6 +908,18 @@ impl VlmMmprojBridge {
             return Err(mismatch_err(
                 arch,
                 "mmproj llm_embed_dim cannot be zero when specified",
+            ));
+        }
+        if self.spatial_avg_pool == Some(0) {
+            return Err(mismatch_err(
+                arch,
+                "mmproj spatial_avg_pool cannot be zero when specified",
+            ));
+        }
+        if self.merge_2x2_pixel_shuffle && self.spatial_avg_pool.is_some_and(|k| k > 1) {
+            return Err(mismatch_err(
+                arch,
+                "mmproj cannot enable both merge_2x2_pixel_shuffle and spatial_avg_pool",
             ));
         }
         if !self.norm_eps.is_finite() || self.norm_eps <= 0.0 {
@@ -786,6 +933,122 @@ impl VlmMmprojBridge {
         }
         Ok(())
     }
+}
+
+fn apply_optional_seq_rmsnorm(
+    weights: &dyn ModelWeights,
+    aliases: &[&str],
+    input: &[f32],
+    token_count: usize,
+    hidden_dim: usize,
+    norm_eps: f32,
+    arch: &str,
+) -> Result<Option<Vec<f32>>, K3Error> {
+    let Some(norm_w_view) = lookup_optional_tensor(weights, aliases)? else {
+        return Ok(None);
+    };
+    let norm_w = decode_1d_view(&norm_w_view, hidden_dim, arch)?;
+    let mut out = vec![0.0_f32; input.len()];
+    apply_rmsnorm_seq(&mut out, input, token_count, hidden_dim, &norm_w, norm_eps)?;
+    Ok(Some(out))
+}
+
+fn linear_proj_is_transposed(
+    weights: &dyn ModelWeights,
+    view: &TensorView<'_>,
+    in_dim: usize,
+    out_dim: usize,
+) -> bool {
+    let shape = view.shape();
+    if shape.len() != 2 {
+        return false;
+    }
+    let is_gguf_layout = if let Ok(Some(patch)) = lookup_optional_tensor(
+        weights,
+        &[
+            "v.patch_embd.weight",
+            "vision_model.embeddings.patch_embedding.weight",
+        ],
+    ) {
+        let s = patch.shape();
+        if s.len() == 4 && s[0] == s[1] && s[2] <= 4 && s[3] > 4 {
+            true
+        } else if s.len() == 4 && s[2] == s[3] && s[1] <= 4 && s[0] > 4 {
+            false
+        } else {
+            view.name().starts_with("mm.") || view.name().starts_with("mm_input_proj")
+        }
+    } else if let Ok(Some(pos)) = lookup_optional_tensor(
+        weights,
+        &[
+            "v.position_embd.weight",
+            "vision_model.embeddings.position_embedding.weight",
+        ],
+    ) {
+        let s = pos.shape();
+        if s.len() == 2 && s[0] < s[1] && view.name().starts_with("mm.") {
+            true
+        } else {
+            view.name().starts_with("mm.") || view.name().starts_with("mm_input_proj")
+        }
+    } else {
+        view.name().starts_with("mm.") || view.name().starts_with("mm_input_proj")
+    };
+
+    if is_gguf_layout {
+        if in_dim == out_dim {
+            view.name().contains("input_projection") || view.name().contains("input_proj")
+        } else {
+            shape[0] == out_dim && shape[1] == in_dim
+        }
+    } else if in_dim != out_dim {
+        shape[0] == in_dim && shape[1] == out_dim
+    } else {
+        false
+    }
+}
+
+fn resolve_spatial_merge_mode(
+    weights: &dyn ModelWeights,
+    arch: &str,
+    proj_type: &str,
+    vision_hidden: usize,
+    merge_size: Option<usize>,
+    has_soft_emb_norm: bool,
+    has_qwen_merger: bool,
+) -> (bool, Option<usize>) {
+    let has_mlp_fc1 = lookup_optional_tensor(weights, MLP_FC1_WEIGHT_ALIASES)
+        .ok()
+        .flatten()
+        .is_some();
+    let lin_expects_unmerged = lookup_optional_tensor(weights, LINEAR_PROJ_WEIGHT_ALIASES)
+        .ok()
+        .flatten()
+        .is_some_and(|v| {
+            v.shape().contains(&vision_hidden) && !v.shape().contains(&(vision_hidden * 4))
+        });
+
+    if has_soft_emb_norm
+        || (!has_mlp_fc1
+            && lin_expects_unmerged
+            && (proj_type.contains("gemma3") || arch.contains("gemma3")))
+    {
+        (false, Some(merge_size.unwrap_or(4)))
+    } else {
+        let mut merge_2x2 =
+            prefers_pixel_shuffle(arch) || prefers_pixel_shuffle(proj_type) || has_qwen_merger;
+        if let Some(ms) = merge_size {
+            merge_2x2 = ms == 2;
+        }
+        (merge_2x2, None)
+    }
+}
+
+fn gguf_norm_eps(gguf: &GgufFile<'_>) -> f32 {
+    gguf.metadata_value("clip.vision.attention.layer_norm_epsilon")
+        .and_then(jero_core::GgufValue::as_f32)
+        .filter(|v| v.is_finite() && *v > 0.0_f32)
+        .unwrap_or(1e-6_f32)
 }
 
 fn apply_optional_seq_norm(
@@ -935,4 +1198,280 @@ fn st_usize(st: &SafeTensorsFile<'_>, keys: &[&str]) -> Option<usize> {
     keys.iter()
         .find_map(|key| st.metadata_value(key)?.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
+    use jero_core::{ArchRecipe, GgufFile, GgufValue, K3Error, ModelWeights, QuantType};
+
+    use super::{VisionEncoderConfig, VlmMmprojBridge};
+
+    fn pattern_f32(len: usize, seed: usize) -> Vec<f32> {
+        (0..len)
+            .map(|idx| {
+                let rem = i16::try_from((idx * 13 + seed * 29) % 19).expect("rem fits i16");
+                (f32::from(rem) - 9.0) * 0.04_f32
+            })
+            .collect()
+    }
+
+    fn f32_to_le_bytes(vals: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(size_of_val(vals));
+        for &v in vals {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    #[derive(Clone, Copy)]
+    enum FfnCase {
+        Swapped,
+        DuplicateShape,
+        SwappedBiasWithNormalWeights,
+    }
+
+    fn gemma3_layer0_specs(
+        hidden: usize,
+        ffn: usize,
+        ffn_case: FfnCase,
+    ) -> Vec<(&'static str, Vec<usize>, Vec<f32>)> {
+        let (up_shape, down_shape, up_b_len, down_b_len) = match ffn_case {
+            FfnCase::Swapped => (vec![ffn, hidden], vec![hidden, ffn], hidden, ffn),
+            FfnCase::DuplicateShape => (vec![ffn, hidden], vec![ffn, hidden], hidden, ffn),
+            FfnCase::SwappedBiasWithNormalWeights => {
+                (vec![hidden, ffn], vec![ffn, hidden], hidden, ffn)
+            }
+        };
+        vec![
+            (
+                "v.blk.0.attn_q.weight",
+                vec![hidden, hidden],
+                pattern_f32(hidden * hidden, 4),
+            ),
+            ("v.blk.0.attn_q.bias", vec![hidden], pattern_f32(hidden, 5)),
+            (
+                "v.blk.0.attn_k.weight",
+                vec![hidden, hidden],
+                pattern_f32(hidden * hidden, 6),
+            ),
+            ("v.blk.0.attn_k.bias", vec![hidden], pattern_f32(hidden, 7)),
+            (
+                "v.blk.0.attn_v.weight",
+                vec![hidden, hidden],
+                pattern_f32(hidden * hidden, 8),
+            ),
+            ("v.blk.0.attn_v.bias", vec![hidden], pattern_f32(hidden, 9)),
+            (
+                "v.blk.0.attn_out.weight",
+                vec![hidden, hidden],
+                pattern_f32(hidden * hidden, 10),
+            ),
+            (
+                "v.blk.0.attn_out.bias",
+                vec![hidden],
+                pattern_f32(hidden, 11),
+            ),
+            ("v.blk.0.ln1.weight", vec![hidden], vec![1.0_f32; hidden]),
+            ("v.blk.0.ln1.bias", vec![hidden], vec![0.0_f32; hidden]),
+            (
+                "v.blk.0.ffn_up.weight",
+                up_shape,
+                pattern_f32(ffn * hidden, 12),
+            ),
+            (
+                "v.blk.0.ffn_up.bias",
+                vec![up_b_len],
+                pattern_f32(up_b_len, 13),
+            ),
+            (
+                "v.blk.0.ffn_down.weight",
+                down_shape,
+                pattern_f32(hidden * ffn, 14),
+            ),
+            (
+                "v.blk.0.ffn_down.bias",
+                vec![down_b_len],
+                pattern_f32(down_b_len, 15),
+            ),
+            ("v.blk.0.ln2.weight", vec![hidden], vec![1.0_f32; hidden]),
+            ("v.blk.0.ln2.bias", vec![hidden], vec![0.0_f32; hidden]),
+        ]
+    }
+
+    fn build_gemma3_gguf(
+        hidden: usize,
+        ffn: usize,
+        patch: usize,
+        img_side: usize,
+        llm_dim: usize,
+        ffn_case: FfnCase,
+        soft_norm_len: usize,
+    ) -> Vec<u8> {
+        let grid = img_side / patch;
+        let num_pos = grid * grid;
+        let kvs = [
+            (
+                "clip.vision.image_size",
+                GgufValue::Uint32(u32::try_from(img_side).expect("u32")),
+            ),
+            (
+                "clip.vision.patch_size",
+                GgufValue::Uint32(u32::try_from(patch).expect("u32")),
+            ),
+            (
+                "clip.vision.embedding_length",
+                GgufValue::Uint32(u32::try_from(hidden).expect("u32")),
+            ),
+            (
+                "clip.vision.feed_forward_length",
+                GgufValue::Uint32(u32::try_from(ffn).expect("u32")),
+            ),
+            (
+                "clip.vision.projection_dim",
+                GgufValue::Uint32(u32::try_from(llm_dim).expect("u32")),
+            ),
+            ("clip.vision.block_count", GgufValue::Uint32(1)),
+            ("clip.vision.attention.head_count", GgufValue::Uint32(2)),
+            (
+                "clip.vision.attention.layer_norm_epsilon",
+                GgufValue::Float32(1e-6),
+            ),
+            ("clip.projector_type", GgufValue::String("gemma3")),
+            ("clip.use_gelu", GgufValue::Bool(true)),
+        ];
+
+        let mut specs_owned: Vec<(&str, Vec<usize>, Vec<f32>)> = vec![
+            (
+                "v.patch_embd.weight",
+                vec![patch, patch, 3, hidden],
+                pattern_f32(hidden * 3 * patch * patch, 1),
+            ),
+            ("v.patch_embd.bias", vec![hidden], pattern_f32(hidden, 2)),
+            (
+                "v.position_embd.weight",
+                vec![hidden, num_pos],
+                pattern_f32(hidden * num_pos, 3),
+            ),
+        ];
+        specs_owned.extend(gemma3_layer0_specs(hidden, ffn, ffn_case));
+        specs_owned.extend([
+            ("v.post_ln.weight", vec![hidden], vec![1.0_f32; hidden]),
+            ("v.post_ln.bias", vec![hidden], vec![0.0_f32; hidden]),
+            (
+                "mm.soft_emb_norm.weight",
+                vec![soft_norm_len],
+                vec![1.1_f32; soft_norm_len],
+            ),
+            (
+                "mm.input_projection.weight",
+                vec![llm_dim, hidden],
+                pattern_f32(hidden * llm_dim, 16),
+            ),
+        ]);
+
+        let tensor_specs: Vec<(&str, QuantType, &[usize])> = specs_owned
+            .iter()
+            .map(|(n, s, _)| (*n, QuantType::F32, s.as_slice()))
+            .collect();
+        let mut bytes = create_synthetic_gguf_v3_with_kvs("clip", 1, &kvs, &tensor_specs);
+        let ranges: Vec<(usize, usize)> = {
+            let parsed = GgufFile::parse(&bytes).expect("parse layout");
+            specs_owned
+                .iter()
+                .map(|(n, _, _)| {
+                    let tv = parsed.tensor(n).expect("tensor present");
+                    (tv.offset(), tv.byte_len())
+                })
+                .collect()
+        };
+        for ((off, len), (_, _, vals)) in ranges.into_iter().zip(specs_owned.iter()) {
+            let payload = f32_to_le_bytes(vals);
+            assert_eq!(payload.len(), len);
+            bytes[off..off + len].copy_from_slice(&payload);
+        }
+        bytes
+    }
+
+    #[test]
+    fn gemma3_gguf_swapped_ffn_avg_pool_and_soft_emb_norm_hydrate_and_project() {
+        let gguf_bytes = build_gemma3_gguf(8, 16, 2, 8, 12, FfnCase::Swapped, 8);
+        let gguf = GgufFile::parse(&gguf_bytes).expect("parse gemma3 gguf");
+
+        let bridge = VlmMmprojBridge::from_gguf(&gguf);
+        assert!(matches!(bridge.encoder, VisionEncoderConfig::Siglip(_)));
+        assert!(!bridge.merge_2x2_pixel_shuffle);
+        assert_eq!(bridge.spatial_avg_pool, Some(4));
+        assert_eq!(bridge.llm_embed_dim, Some(12));
+
+        if let VisionEncoderConfig::Siglip(ref sig) = bridge.encoder {
+            sig.validate_model(gguf.metadata(), &gguf)
+                .expect("swapped gemma3 FFN validates cleanly");
+        }
+
+        let src_hwc = pattern_f32(8 * 8 * 3, 25);
+        let (embeds, n_tok, dim) = bridge
+            .encode_rgb_hwc_to_soft_prompt(&gguf, &src_hwc, 8, 8, 8, 8)
+            .expect("gemma3 mmproj forward succeeds");
+        // 8x8 image with patch_size=2 -> 4x4 grid, 4x4 avg-pool -> 1 token of dim 12
+        assert_eq!(n_tok, 1);
+        assert_eq!(dim, 12);
+        assert_eq!(embeds.len(), 12);
+        assert!(embeds.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn gemma3_malformed_ffn_and_projector_shapes_fail_closed() {
+        // 1. Both ffn_up and ffn_down sharing [ffn, hidden] shape fails closed
+        let dup_bytes = build_gemma3_gguf(8, 16, 2, 8, 12, FfnCase::DuplicateShape, 8);
+        let dup_gguf = GgufFile::parse(&dup_bytes).expect("parse dup gguf");
+        let dup_bridge = VlmMmprojBridge::from_gguf(&dup_gguf);
+        if let VisionEncoderConfig::Siglip(ref sig) = dup_bridge.encoder {
+            assert!(matches!(
+                sig.validate_model(dup_gguf.metadata(), &dup_gguf),
+                Err(K3Error::TensorBoundsError { .. })
+            ));
+        }
+        let pixels = pattern_f32(3 * 8 * 8, 31);
+        assert!(matches!(
+            dup_bridge.encode_image_to_soft_prompt(&dup_gguf, &pixels, 3, 8, 8),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        // 2. Swapped biases on unswapped weights fails closed
+        let bias_bytes =
+            build_gemma3_gguf(8, 16, 2, 8, 12, FfnCase::SwappedBiasWithNormalWeights, 8);
+        let bias_gguf = GgufFile::parse(&bias_bytes).expect("parse bias mismatch gguf");
+        let bias_bridge = VlmMmprojBridge::from_gguf(&bias_gguf);
+        assert!(matches!(
+            bias_bridge.encode_image_to_soft_prompt(&bias_gguf, &pixels, 3, 8, 8),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        // 3. Bad mm.soft_emb_norm length (12 != hidden_dim 8) fails closed
+        let bad_norm_bytes = build_gemma3_gguf(8, 16, 2, 8, 12, FfnCase::Swapped, 12);
+        let bad_norm_gguf = GgufFile::parse(&bad_norm_bytes).expect("parse bad norm gguf");
+        let bad_norm_bridge = VlmMmprojBridge::from_gguf(&bad_norm_gguf);
+        assert!(matches!(
+            bad_norm_bridge.encode_image_to_soft_prompt(&bad_norm_gguf, &pixels, 3, 8, 8),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        // 4. Patch grid (2x2 for 4x4 image) not divisible by 4x4 avg-pool fails closed
+        let ok_bytes = build_gemma3_gguf(8, 16, 2, 8, 12, FfnCase::Swapped, 8);
+        let ok_gguf = GgufFile::parse(&ok_bytes).expect("parse ok gguf");
+        let ok_bridge = VlmMmprojBridge::from_gguf(&ok_gguf);
+        let small_pixels = pattern_f32(3 * 4 * 4, 41);
+        assert!(matches!(
+            ok_bridge.encode_image_to_soft_prompt(&ok_gguf, &small_pixels, 3, 4, 4),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        // 5. Enabling both 2x2 pixel-shuffle and 4x4 spatial avg-pool fails closed
+        let conflicting = ok_bridge.with_pixel_shuffle_2x2(true);
+        assert!(matches!(
+            conflicting.encode_image_to_soft_prompt(&ok_gguf, &pixels, 3, 8, 8),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+    }
 }

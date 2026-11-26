@@ -947,6 +947,304 @@ pub(crate) fn apply_layernorm_seq(
     Ok(())
 }
 
+/// Computes standard `RMSNorm` (`x / sqrt(mean(x^2) + eps) * weight`) over a single vector.
+pub(crate) fn rmsnorm_f32(
+    out: &mut [f32],
+    input: &[f32],
+    weight: &[f32],
+    eps: f32,
+) -> Result<(), K3Error> {
+    let len = input.len();
+    if len == 0 || out.len() != len || weight.len() != len || !eps.is_finite() || eps <= 0.0_f32 {
+        return Err(bounds_err(
+            "rmsnorm",
+            len,
+            out.len(),
+            "invalid rmsnorm arguments or slice length mismatch",
+        ));
+    }
+    validate_finite_slice("rmsnorm_input", input)?;
+    validate_finite_slice("rmsnorm_weight", weight)?;
+    #[cfg(feature = "with-kernels")]
+    {
+        BaselineKernel::new().rmsnorm(out, input, weight, eps)?;
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        #[expect(clippy::cast_precision_loss, reason = "vector length fits f32")]
+        let mean_sq = dot_f32(input, input) / (len as f32);
+        let inv_rms = 1.0_f32 / (mean_sq + eps).sqrt();
+        for ((dst, &x), &w) in out.iter_mut().zip(input.iter()).zip(weight.iter()) {
+            *dst = x * inv_rms * w;
+        }
+    }
+    validate_finite_slice("rmsnorm_output", out)
+}
+
+/// Applies `rmsnorm_f32` per token across `[seq_len, hidden_dim]`.
+pub(crate) fn apply_rmsnorm_seq(
+    out: &mut [f32],
+    input: &[f32],
+    seq_len: usize,
+    hidden_dim: usize,
+    weight: &[f32],
+    eps: f32,
+) -> Result<(), K3Error> {
+    let total = checked_mul("rmsnorm_seq", seq_len, hidden_dim)?;
+    if out.len() != total || input.len() != total {
+        return Err(bounds_err(
+            "rmsnorm_seq",
+            total,
+            out.len(),
+            "rmsnorm sequence slice length mismatch",
+        ));
+    }
+    for t in 0..seq_len {
+        let range = t * hidden_dim..(t + 1) * hidden_dim;
+        rmsnorm_f32(&mut out[range.clone()], &input[range], weight, eps)?;
+    }
+    Ok(())
+}
+
+/// Computes non-overlapping 2D spatial average pooling over `[grid_h, grid_w, hidden_dim]`
+/// into `[grid_h / kernel, grid_w / kernel, hidden_dim]` (Gemma-3 projector convention).
+pub(crate) fn spatial_avg_pool_2d_f32(
+    out_pooled: &mut [f32],
+    patches: &[f32],
+    grid_h: usize,
+    grid_w: usize,
+    hidden_dim: usize,
+    kernel: usize,
+) -> Result<(), K3Error> {
+    if kernel == 0
+        || grid_h < kernel
+        || grid_w < kernel
+        || hidden_dim == 0
+        || grid_h % kernel != 0
+        || grid_w % kernel != 0
+    {
+        return Err(bounds_err(
+            "spatial_avg_pool_2d",
+            0,
+            patches.len(),
+            format!(
+                "spatial_avg_pool_2d requires grid {grid_h}x{grid_w} divisible by non-zero kernel {kernel}"
+            ),
+        ));
+    }
+    let in_tokens = checked_mul("spatial_avg_pool_in", grid_h, grid_w)?;
+    let in_elems = checked_mul("spatial_avg_pool_in", in_tokens, hidden_dim)?;
+    let out_h = grid_h / kernel;
+    let out_w = grid_w / kernel;
+    let out_tokens = checked_mul("spatial_avg_pool_out", out_h, out_w)?;
+    let out_elems = checked_mul("spatial_avg_pool_out", out_tokens, hidden_dim)?;
+    if patches.len() != in_elems || out_pooled.len() != out_elems {
+        return Err(bounds_err(
+            "spatial_avg_pool_2d",
+            out_elems,
+            out_pooled.len(),
+            "spatial_avg_pool_2d buffer length mismatch",
+        ));
+    }
+    validate_finite_slice("spatial_avg_pool_patches", patches)?;
+    if kernel == 1 {
+        out_pooled.copy_from_slice(patches);
+        return Ok(());
+    }
+    let area = checked_mul("spatial_avg_pool_area", kernel, kernel)?;
+    #[expect(clippy::cast_precision_loss, reason = "pooling kernel area fits f32")]
+    let inv_area = 1.0_f32 / (area as f32);
+    out_pooled.fill(0.0_f32);
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let dst = &mut out_pooled[(oy * out_w + ox) * hidden_dim..][..hidden_dim];
+            for ky in 0..kernel {
+                let sy = oy * kernel + ky;
+                for kx in 0..kernel {
+                    let sx = ox * kernel + kx;
+                    let src = &patches[(sy * grid_w + sx) * hidden_dim..][..hidden_dim];
+                    for (d_slot, &s_val) in dst.iter_mut().zip(src.iter()) {
+                        *d_slot += s_val;
+                    }
+                }
+            }
+            for d_slot in dst.iter_mut() {
+                *d_slot *= inv_area;
+            }
+        }
+    }
+    validate_finite_slice("spatial_avg_pool_out", out_pooled)
+}
+
+/// Applies `out[t] = input[t] @ W (+ bias)` where `matrix` stores `[in_dim, out_dim]` rows
+/// (e.g. Gemma-3 `mm.input_projection.weight`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "transposed linear forward accepts pre-validated matrix, optional bias, and sequence buffers"
+)]
+pub(crate) fn linear_forward_seq_transposed(
+    out: &mut [f32],
+    matrix: &MatrixSlice<'_>,
+    bias: Option<&[f32]>,
+    input: &[f32],
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+    arch: &str,
+) -> Result<(), K3Error> {
+    if matrix.rows != in_dim || matrix.cols != out_dim {
+        return Err(bounds_err(
+            matrix.name,
+            in_dim.saturating_mul(out_dim),
+            matrix.rows.saturating_mul(matrix.cols),
+            format!(
+                "transposed linear matrix '{}' expected [{in_dim}, {out_dim}], got [{}, {}]",
+                matrix.name, matrix.rows, matrix.cols
+            ),
+        ));
+    }
+    if let Some(b) = bias
+        && b.len() != out_dim
+    {
+        return Err(bounds_err(
+            matrix.name,
+            out_dim,
+            b.len(),
+            format!("bias length {} != expected out_dim {out_dim}", b.len()),
+        ));
+    }
+    let expected_in = checked_mul(matrix.name, seq_len, in_dim)?;
+    let expected_out = checked_mul(matrix.name, seq_len, out_dim)?;
+    if input.len() != expected_in || out.len() != expected_out {
+        return Err(bounds_err(
+            matrix.name,
+            expected_out,
+            out.len(),
+            format!(
+                "transposed linear sequence buffer mismatch: seq_len={seq_len}, in={} (expected {expected_in}), out={} (expected {expected_out})",
+                input.len(),
+                out.len()
+            ),
+        ));
+    }
+    for t in 0..seq_len {
+        let in_row = &input[t * in_dim..(t + 1) * in_dim];
+        let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
+        matvec_transposed_slice(out_row, matrix, in_row, arch)?;
+        if let Some(b) = bias {
+            for (dst, &bv) in out_row.iter_mut().zip(b.iter()) {
+                *dst += bv;
+            }
+        }
+    }
+    validate_finite_slice(matrix.name, out)
+}
+
+fn matvec_transposed_slice(
+    out: &mut [f32],
+    matrix: &MatrixSlice<'_>,
+    input: &[f32],
+    arch: &str,
+) -> Result<(), K3Error> {
+    let in_dim = matrix.rows;
+    let out_dim = matrix.cols;
+    if input.len() != in_dim || out.len() != out_dim {
+        return Err(bounds_err(
+            matrix.name,
+            out_dim,
+            out.len(),
+            format!(
+                "transposed matvec dimension mismatch for '{}': out={} (expected {out_dim}), in={} (expected {in_dim})",
+                matrix.name,
+                out.len(),
+                input.len()
+            ),
+        ));
+    }
+    if !is_supported_vision_quant(matrix.quant) {
+        return Err(K3Error::unsupported_tensor_quant(
+            arch,
+            matrix.name,
+            matrix.quant,
+        ));
+    }
+    let req_bytes = matrix
+        .quant
+        .storage_bytes(matrix.name, checked_mul(matrix.name, in_dim, out_dim)?)?;
+    if matrix.raw.len() < req_bytes {
+        return Err(bounds_err(
+            matrix.name,
+            req_bytes,
+            matrix.raw.len(),
+            format!(
+                "transposed matrix '{}' buffer length {} < required {req_bytes}",
+                matrix.name,
+                matrix.raw.len()
+            ),
+        ));
+    }
+
+    out.fill(0.0_f32);
+    match matrix.quant {
+        QuantType::F32 => {
+            let stride = out_dim * size_of::<f32>();
+            for (r, &x) in input.iter().enumerate() {
+                let row = &matrix.raw[r * stride..(r + 1) * stride];
+                for (dst, chunk) in out.iter_mut().zip(row.chunks_exact(size_of::<f32>())) {
+                    let w = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    *dst += x * w;
+                }
+            }
+        }
+        QuantType::F16 | QuantType::BF16 => {
+            let stride = out_dim * size_of::<u16>();
+            let is_bf16 = matches!(matrix.quant, QuantType::BF16);
+            for (r, &x) in input.iter().enumerate() {
+                let row = &matrix.raw[r * stride..(r + 1) * stride];
+                for (dst, chunk) in out.iter_mut().zip(row.chunks_exact(size_of::<u16>())) {
+                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    let w = if is_bf16 {
+                        bf16_to_f32_ieee(bits)
+                    } else {
+                        f16_to_f32_ieee(bits)
+                    };
+                    *dst += x * w;
+                }
+            }
+        }
+        #[cfg(feature = "with-kernels")]
+        quant => {
+            let blk = quant.block_elements();
+            if out_dim % blk != 0 {
+                return Err(bounds_err(
+                    matrix.name,
+                    0,
+                    matrix.raw.len(),
+                    format!(
+                        "transposed quantized matrix '{}' out_dim {out_dim} not divisible by {} block size {blk}",
+                        matrix.name,
+                        quant.as_str()
+                    ),
+                ));
+            }
+            let shape = [out_dim, in_dim];
+            let tv = TensorView::from_bytes(matrix.name, quant, &shape, 0, matrix.raw)?;
+            let mut row_buf = vec![0.0_f32; out_dim];
+            for (r, &x) in input.iter().enumerate() {
+                dequantize_token_row(&tv, r, &mut row_buf)?;
+                for (dst, &w) in out.iter_mut().zip(row_buf.iter()) {
+                    *dst += x * w;
+                }
+            }
+        }
+        #[cfg(not(feature = "with-kernels"))]
+        other => {
+            return Err(K3Error::unsupported_tensor_quant(arch, matrix.name, other));
+        }
+    }
+    validate_finite_slice(matrix.name, out)
+}
+
 // ============================================================================
 // Unified Vision / Attention / Norm / Embedding Kernel Wrappers
 // ============================================================================
